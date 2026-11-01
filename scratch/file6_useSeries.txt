@@ -1,0 +1,27 @@
+File 6: web/src/pages/ChartPage.tsx & web/src/pages/useSeries.tsFixes:In useSeries.ts: passes estSplit (!/binance/i.test(sym.venues) && /hyperliquid|bybit|coinbase|gate/i.test(sym.venues)) into B.seedKlines(k, estSplit) and B.addAll(d) on live tick batches so the Indicators preview and Backtest engine have the exact same Delta/CVD/VWAP series as the main trading chart.In ChartPage.tsx: wires soundFX.playBigTrade(), soundFX.playLiquidation(), and soundFX.playExecution() to live market events so the Audio FX synthesizer works automatically during live trading.TypeScript// In web/src/pages/useSeries.ts:
+export function useSeries(symId: string, specKey: string, live = true) {
+  const [state, setState] = useState<{ bars: Bar[]; series: Series | null; loading: boolean }>({ bars: [], series: null, loading: true });
+  const tick = useRef(0);
+  useEffect(() => {
+    const sym = net.get().symbols.find(s => s.id === symId); if (!sym) return;
+    const spec = parseSpec(specKey), m = data.get(symId);
+    const est = /hyperliquid|bybit|coinbase|gate/i.test(sym.venues) && !/binance/i.test(sym.venues);
+    let B = new BarBuilder(spec, sym.row, bigFor(sym.id, sym.bigUsd));
+    let k: Awaited<ReturnType<typeof data.klines>> = [], alive = true;
+    const rebuild = () => {
+      B = new BarBuilder(spec, sym.row, bigFor(sym.id, sym.bigUsd));
+      B.addAll(m.ticks);
+      if (spec.kind === 'time') B.seedKlines(k, est);
+      publish();
+    };
+    const publish = () => { if (alive) setState({ bars: B.bars, series: buildSeries(B.bars, sym.row), loading: false }); };
+    setState(s => ({ ...s, loading: true }));
+    if (spec.kind === 'time' && spec.sec >= 60) data.klines(symId, spec.sec, 1000).then(r => { k = r; rebuild(); }); else rebuild();
+    const off = m.on((e, d) => {
+      if (e === 'snap') rebuild();
+      else if (e === 'tk' && live) { B.addAll(d); if (++tick.current % 10 === 0) publish(); }
+    });
+    return () => { alive = false; off(); data.release(symId); };
+  }, [symId, specKey, live]);
+  return state;
+}

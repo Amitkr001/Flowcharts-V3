@@ -1,0 +1,338 @@
+import fs from 'fs';
+
+const path = 'web/src/chart/drawings.ts';
+let code = fs.readFileSync(path, 'utf8');
+
+// 1. Replace rangeStats
+const rangeStatsOldRegex = /function rangeStats\(V: DView, t0: number, t1: number, plo = -Infinity, phi = Infinity\): RS \| null \{[\s\S]*?\n\}/;
+
+const newRangeStats = `function rangeStats(V: DView, t0: number, t1: number, plo = -Infinity, phi = Infinity): RS | null {
+  const bars = V.bars; if (!bars.length) return null;
+  if (t0 > t1) [t0, t1] = [t1, t0];
+  const i0 = Math.max(0, barIndexFrom(bars, t0)), i1 = Math.min(bars.length - 1, barIndexAt(bars, t1));
+  if (i1 < i0) return null;
+  const band = isFinite(plo) || isFinite(phi), prof = new Map<number, number>(), cvd: number[] = [];
+  let vol = 0, buy = 0, sell = 0, hi = -Infinity, lo = Infinity, pv = 0, bigB = 0, bigS = 0, bigBq = 0, bigSq = 0, cum = 0;
+  for (let i = i0; i <= i1; i++) {
+    const b = bars[i]; hi = Math.max(hi, b.h); lo = Math.min(lo, b.l);
+    let bb = 0, ss = 0;
+    if (b.fp.size) {
+      for (const [k, [s, q]] of b.fp) {
+        const p = k * V.row;
+        if (p < plo || p > phi) continue;
+        bb += q; ss += s;
+        pv += p * (q + s);
+        prof.set(k, (prof.get(k) || 0) + q + s);
+      }
+    } else if (!band || (b.h >= plo && b.l <= phi)) {
+      const share = band ? Math.max(0, Math.min(b.h, phi) - Math.max(b.l, plo)) / ((b.h - b.l) || 1) : 1;
+      bb = b.b * share; ss = b.s * share;
+      const tp = (b.h + b.l + b.c) / 3;
+      pv += tp * (bb + ss);
+      const k = Math.round(tp / V.row);
+      prof.set(k, (prof.get(k) || 0) + bb + ss);
+    }
+    buy += bb; sell += ss; vol += bb + ss; cum += bb - ss; cvd.push(cum);
+    for (const t of b.big) { if (t[1] < plo || t[1] > phi) continue; if (t[3] > 0) { bigB++; bigBq += t[2]; } else { bigS++; bigSq += t[2]; } }
+  }
+  let poc: number | null = null, mx = 0; for (const [k, v] of prof) if (v > mx) { mx = v; poc = k * V.row; }
+  const j0 = Math.max(0, i0 - 50), j1 = i0 > 10 ? i0 - 1 : i1; let sv = 0, sr = 0, m = 0;
+  for (let j = j0; j <= j1; j++) { sv += bars[j].v; sr += bars[j].h - bars[j].l; m++; }
+  return { n: i1 - i0 + 1, i0, i1, o: bars[i0].o, c: bars[i1].c, hi, lo, vol, buy, sell, delta: buy - sell, cvd, poc, vwap: vol ? pv / vol : NaN, bigB, bigS, bigBq, bigSq, avgVol: m ? sv / m : 0, avgRng: m ? sr / m : 0, ms: bars[i1].t - bars[i0].t };
+}`;
+
+if (!rangeStatsOldRegex.test(code)) {
+  console.error("Could not find rangeStats in drawings.ts!");
+  process.exit(1);
+}
+code = code.replace(rangeStatsOldRegex, newRangeStats);
+console.log("Replaced rangeStats successfully.");
+
+// 2. Replace fixedvp
+const fixedVpOldRegex = /\{\s*id:\s*'fixedvp',[\s\S]*?\n\s*\}\s*\},(?=\s*\{\s*id:\s*'imbzone')/;
+
+const newFixedVp = `{ id: 'fixedvp', label: 'Fixed range volume profile', group: 'Volume Profile', icon: 'fixedvp', n: 2, color: '#7d7432', key: 'Alt+P',
+    init(d, V) {
+      if (d.pts.length < 2) return;
+      const ta = Math.min(d.pts[0].t, d.pts[1].t), tb = Math.max(d.pts[0].t, d.pts[1].t);
+      const i0 = Math.max(0, barIndexFrom(V.bars, ta)), i1 = barIndexAt(V.bars, tb);
+      let hi = -Infinity, lo = Infinity;
+      for (let i = i0; i <= i1; i++) { hi = Math.max(hi, V.bars[i].h); lo = Math.min(lo, V.bars[i].l); }
+      if (isFinite(hi) && isFinite(lo)) {
+        d.pts[0] = { t: ta, p: hi };
+        d.pts[1] = { t: tb, p: lo };
+      }
+    },
+    moveHandle(d, hi, pt) {
+      if (d.pts.length < 2) return;
+      let t1 = Math.min(d.pts[0].t, d.pts[1].t), t2 = Math.max(d.pts[0].t, d.pts[1].t);
+      let p1 = Math.max(d.pts[0].p, d.pts[1].p), p2 = Math.min(d.pts[0].p, d.pts[1].p);
+      if (hi === 0) { t1 = pt.t; p1 = pt.p; }
+      else if (hi === 1) { t2 = pt.t; p1 = pt.p; }
+      else if (hi === 2) { t1 = pt.t; p2 = pt.p; }
+      else if (hi === 3) { t2 = pt.t; p2 = pt.p; }
+      else if (hi === 4 || hi === 5) { p1 = pt.p; }
+      else if (hi === 6 || hi === 7) { p2 = pt.p; }
+      else if (hi === 8 || hi === 9) { t2 = pt.t; }
+      d.pts[0] = { t: Math.min(t1, t2), p: Math.max(p1, p2) };
+      d.pts[1] = { t: Math.max(t1, t2), p: Math.min(p1, p2) };
+    },
+    render(g, d, V, s) {
+      if (d.pts.length < 2) return;
+      const ta = Math.min(d.pts[0].t, d.pts[1].t), tb = Math.max(d.pts[0].t, d.pts[1].t);
+      const x1 = Math.min(V.x(d.pts[0].t), V.x(d.pts[1].t)), x2 = Math.max(V.x(d.pts[0].t), V.x(d.pts[1].t));
+      const i0 = Math.max(0, barIndexFrom(V.bars, ta)), i1 = barIndexAt(V.bars, tb);
+
+      let barHi = -Infinity, barLo = Infinity;
+      for (let i = i0; i <= i1; i++) { barHi = Math.max(barHi, V.bars[i].h); barLo = Math.min(barLo, V.bars[i].l); }
+      if (!isFinite(barHi)) return;
+
+      const pHi = Math.max(d.pts[0].p, d.pts[1].p), pLo = Math.min(d.pts[0].p, d.pts[1].p);
+      const hi = Math.abs(pHi - pLo) < V.tick ? barHi : pHi;
+      const lo = Math.abs(pHi - pLo) < V.tick ? barLo : pLo;
+      const yTop = Math.min(V.y(hi), V.y(lo)), yBot = Math.max(V.y(hi), V.y(lo));
+
+      // Align bins strictly to instrument row multiples (V.row)
+      const kMin = Math.floor(lo / V.row), kMax = Math.ceil(hi / V.row);
+      const totalRawRows = Math.max(1, kMax - kMin + 1);
+      const pxPerRow = Math.abs(yBot - yTop) / totalRawRows;
+      const kGroup = Math.max(1, Math.round(3.5 / Math.max(0.01, pxPerRow)));
+      const binStepPrice = kGroup * V.row;
+
+      const rawProf = new Map<number, { s: number; b: number; tot: number }>();
+      let totalProfileVol = 0, sumPriceVol = 0, totalBuyVol = 0, totalSellVol = 0;
+
+      const addRaw = (k: number, ss: number, bb: number) => {
+        const p = k * V.row;
+        if (p < lo - 1e-9 || p > hi + 1e-9) return;
+        let r = rawProf.get(k);
+        if (!r) { r = { s: 0, b: 0, tot: 0 }; rawProf.set(k, r); }
+        r.s += ss; r.b += bb; r.tot += ss + bb;
+        totalProfileVol += ss + bb;
+        totalBuyVol += bb;
+        totalSellVol += ss;
+        sumPriceVol += p * (ss + bb);
+      };
+
+      for (let i = i0; i <= i1; i++) {
+        const b = V.bars[i];
+        if (b.fp && b.fp.size) {
+          for (const [k, [ss, bb]] of b.fp) addRaw(k, ss, bb);
+        } else {
+          const bLo = Math.max(lo, b.l), bHi = Math.min(hi, b.h);
+          if (bHi < bLo) continue;
+          const k0 = Math.round(bLo / V.row), k1 = Math.round(bHi / V.row);
+          const body0 = Math.round(Math.min(b.o, b.c) / V.row), body1 = Math.round(Math.max(b.o, b.c) / V.row);
+          let wSum = 0;
+          for (let k = k0; k <= k1; k++) wSum += (k >= body0 && k <= body1) ? 2 : 1;
+          if (wSum > 0) {
+            const share = (bHi - bLo) / ((b.h - b.l) || 1);
+            const sUnit = (b.s * share) / wSum, bUnit = (b.b * share) / wSum;
+            for (let k = k0; k <= k1; k++) {
+              const w = (k >= body0 && k <= body1) ? 2 : 1;
+              addRaw(k, sUnit * w, bUnit * w);
+            }
+          }
+        }
+      }
+
+      if (!rawProf.size || totalProfileVol <= 0) return;
+
+      interface RowBin {
+        bk: number; pLow: number; pHigh: number; pMid: number; exactPrice: number;
+        totalVol: number; buyVol: number; sellVol: number;
+        maxSubK: number; maxSubVol: number;
+        inValueArea: boolean; isHVN: boolean;
+      }
+
+      const binMap = new Map<number, RowBin>();
+      for (const [k, v] of rawProf) {
+        const bk = Math.floor((k - kMin) / kGroup) * kGroup + kMin;
+        let bin = binMap.get(bk);
+        if (!bin) {
+          const pCenter = (bk + (kGroup - 1) * 0.5) * V.row;
+          bin = {
+            bk,
+            pLow: pCenter - binStepPrice * 0.5,
+            pHigh: pCenter + binStepPrice * 0.5,
+            pMid: pCenter,
+            exactPrice: k * V.row,
+            totalVol: 0, buyVol: 0, sellVol: 0,
+            maxSubK: k, maxSubVol: v.tot,
+            inValueArea: false, isHVN: false,
+          };
+          binMap.set(bk, bin);
+        }
+        bin.totalVol += v.tot;
+        bin.buyVol += v.b;
+        bin.sellVol += v.s;
+        if (v.tot > bin.maxSubVol) {
+          bin.maxSubVol = v.tot;
+          bin.maxSubK = k;
+          bin.exactPrice = k * V.row;
+        }
+      }
+
+      const rows = [...binMap.values()].sort((a, b) => a.bk - b.bk);
+      const numRows = rows.length;
+
+      let maxRowVol = 0, maxDelta = 0, pocRowIdx = 0, deltaPocRowIdx = 0;
+      for (let r = 0; r < numRows; r++) {
+        if (rows[r].totalVol > maxRowVol) {
+          maxRowVol = rows[r].totalVol;
+          pocRowIdx = r;
+        }
+        const dlt = Math.abs(rows[r].buyVol - rows[r].sellVol);
+        if (dlt > maxDelta) {
+          maxDelta = dlt;
+          deltaPocRowIdx = r;
+        }
+      }
+      if (maxRowVol <= 0) return;
+
+      const pocPrice = rows[pocRowIdx].exactPrice;
+      const deltaPocPrice = rows[deltaPocRowIdx].exactPrice;
+      const vwapPrice = sumPriceVol / totalProfileVol;
+
+      // Standard 70% Contiguous Value Area Expansion on true volume
+      const targetVA = totalProfileVol * 0.70;
+      let accumVA = rows[pocRowIdx].totalVol;
+      rows[pocRowIdx].inValueArea = true;
+      let upIdx = pocRowIdx + 1, downIdx = pocRowIdx - 1;
+      while (accumVA < targetVA && (upIdx < numRows || downIdx >= 0)) {
+        const upVol = upIdx < numRows ? rows[upIdx].totalVol : -1;
+        const downVol = downIdx >= 0 ? rows[downIdx].totalVol : -1;
+        if (upVol >= downVol && upIdx < numRows) {
+          rows[upIdx].inValueArea = true;
+          accumVA += upVol;
+          upIdx++;
+        } else if (downIdx >= 0) {
+          rows[downIdx].inValueArea = true;
+          accumVA += downVol;
+          downIdx--;
+        } else break;
+      }
+      const vahPrice = rows[Math.min(numRows - 1, upIdx - 1)].exactPrice;
+      const valPrice = rows[Math.max(0, downIdx + 1)].exactPrice;
+
+      // Identify High-Volume Node (HVN) spikes
+      for (let r = 2; r < numRows - 2; r++) {
+        const cur = rows[r].totalVol;
+        if (
+          cur > maxRowVol * 0.25 &&
+          cur >= rows[r - 1].totalVol &&
+          cur >= rows[r + 1].totalVol &&
+          cur > rows[r - 2].totalVol * 1.05 &&
+          cur > rows[r + 2].totalVol * 1.05
+        ) {
+          rows[r].isHVN = true;
+        }
+      }
+
+      const boxWidth = Math.max(20, x2 - x1);
+      const maxProfileWidth = boxWidth * 0.28;
+      const maxLeftDeltaWidth = Math.min(100, Math.max(45, boxWidth * 0.24));
+
+      // 1. Left-Side Pure Net Delta Profile
+      const deltaContour: [number, number][] = [];
+      rows.forEach(row => {
+        const yTopRow = V.y(row.pHigh);
+        const yBotRow = V.y(row.pLow);
+        const h = Math.max(1.2, Math.abs(yBotRow - yTopRow) - 0.4);
+        const yy = Math.min(yTopRow, yBotRow);
+        const yMid = (yTopRow + yBotRow) / 2;
+
+        const delta = row.buyVol - row.sellVol;
+        const absDelta = Math.abs(delta);
+        if (absDelta <= 0.0001 || maxDelta <= 0) return;
+
+        const w = Math.max(1.5, (absDelta / maxDelta) * maxLeftDeltaWidth);
+        const isBuyer = delta >= 0;
+        const fill = row.inValueArea
+          ? (isBuyer ? 'rgba(34, 197, 139, 0.90)' : 'rgba(168, 85, 247, 0.90)')
+          : (isBuyer ? 'rgba(34, 197, 139, 0.35)' : 'rgba(168, 85, 247, 0.35)');
+
+        g.rect(x1 - w, yy, w, h, { fill, stroke: false });
+        deltaContour.push([x1 - w, yMid]);
+      });
+
+      if (deltaContour.length > 1) {
+        g.poly(deltaContour, { color: 'rgba(255, 255, 255, 0.16)', width: 1 });
+      }
+
+      // 2. Right-Side Volume Profile Histogram
+      const contourPts: [number, number][] = [];
+      rows.forEach(row => {
+        const yTopRow = V.y(row.pHigh);
+        const yBotRow = V.y(row.pLow);
+        const h = Math.max(1.5, Math.abs(yBotRow - yTopRow) + 0.2);
+        const yy = Math.min(yTopRow, yBotRow);
+        const yMid = (yTopRow + yBotRow) / 2;
+        const w = (row.totalVol / maxRowVol) * maxProfileWidth;
+
+        const fill = row.inValueArea ? 'rgba(202, 96, 44, 0.82)' : 'rgba(194, 174, 82, 0.75)';
+        if (w > 0.5) g.rect(x1, yy, w, h, { fill, stroke: false });
+        contourPts.push([x1 + w, yMid]);
+      });
+
+      if (contourPts.length > 1) {
+        g.poly(contourPts, { color: '#e5cf7a', width: 1.1 });
+      }
+
+      // 3. Red Horizontal HVN Spikes
+      rows.forEach(row => {
+        if (row.isHVN) {
+          const yMid = V.y(row.pMid);
+          const w = (row.totalVol / maxRowVol) * maxProfileWidth;
+          g.rect(x1, yMid - 1.1, w + 4, 2.2, { fill: '#e63329', stroke: false });
+        }
+      });
+
+      // 4. Horizontal Reference Lines inside the Box (VAH, VAL, POC, VWAP)
+      const vahY = V.y(vahPrice);
+      g.line(x1, vahY, x2, vahY, { color: 'rgba(82, 168, 196, 0.75)', width: 1, dash: [2, 2] });
+
+      const valY = V.y(valPrice);
+      g.line(x1, valY, x2, valY, { color: 'rgba(82, 168, 196, 0.75)', width: 1, dash: [2, 2] });
+
+      const pocY = V.y(pocPrice);
+      g.line(x1, pocY, x2, pocY, { color: '#d938ca', width: 1.4, dash: [3, 2] });
+
+      const vwapY = V.y(vwapPrice);
+      g.line(x1, vwapY, x2, vwapY, { color: '#e6c619', width: 1.2, dash: [3, 2] });
+
+      if (deltaPocRowIdx !== pocRowIdx) {
+        const deltaPocY = V.y(deltaPocPrice);
+        g.line(x1 - maxLeftDeltaWidth, deltaPocY, x1, deltaPocY, { color: 'rgba(168, 85, 247, 0.75)', width: 1.2, dash: [2, 2] });
+      }
+
+      // 5. Selection Box
+      g.rect(x1, yTop, x2 - x1, yBot - yTop, { stroke: '#7d7432', hitFill: true });
+
+      // 6. Detail Card on Select
+      if (s.sel) {
+        const st = rangeStats(V, ta, tb, lo, hi);
+        g.card(x2, yTop, 'Fixed Volume Profile', [
+          { k: 'POC', v: V.fmt(pocPrice), c: '#d938ca' },
+          { k: 'ΔPOC', v: V.fmt(deltaPocPrice), c: '#a855f7' },
+          { k: 'VWAP', v: V.fmt(vwapPrice), c: '#e6c619' },
+          { k: 'Value Area (70%)', v: V.fmt(valPrice) + ' – ' + V.fmt(vahPrice), c: '#52a8c4' },
+          { k: 'High · low', v: V.fmt(hi) + ' · ' + V.fmt(lo) },
+          { sep: true },
+          { k: 'Total Volume', v: fmtQ(totalProfileVol) },
+          { k: 'Net Delta', v: fq(totalBuyVol - totalSellVol), c: colOf(totalBuyVol - totalSellVol) },
+          { split: [totalBuyVol, totalSellVol] },
+          ...(st && st.cvd.length > 2 ? [{ spark: st.cvd }] : []),
+        ], { accent: '#ca602c' });
+      }
+    } },`;
+
+if (!fixedVpOldRegex.test(code)) {
+  console.error("Could not find fixedvp tool in drawings.ts!");
+  process.exit(1);
+}
+code = code.replace(fixedVpOldRegex, newFixedVp);
+console.log("Replaced fixedvp successfully.");
+
+fs.writeFileSync(path, code, 'utf8');
+console.log("Saved web/src/chart/drawings.ts successfully!");

@@ -1,0 +1,53 @@
+File 5: web/src/data/bookwatch.ts & web/src/components/Docks.tsxFixes:Replaces Math.floor(p / row) with Math.round(p / row) and p = k * row in BookWatcher (bookwatch.ts) and DomDock (Docks.tsx) so Iceberg, Pulled Liquidity, Filled Liquidity markers, and DOM ladder rows match the exact footprint and candle price levels.TypeScript// In web/src/data/bookwatch.ts, replace onTicks and onBook with:
+  private onTicks(ts: [number, number, number, Side, number?][]) {
+    for (const [, p, q, s] of ts) {
+      this.last = p;
+      const L = this.lv.get(this.key(s > 0 ? -1 : 1, Math.round(p / this.row)));
+      if (L) L.traded += q;
+    }
+  }
+
+  private onBook() {
+    const now = Date.now(), row = this.row, bins = new Map<string, { side: Side; k: number; q: number }>();
+    const add = (arr: [number, number][], side: Side) => {
+      for (const [p, q] of arr) {
+        const k = Math.round(p / row), key = this.key(side, k);
+        const e = bins.get(key);
+        if (e) e.q += q; else bins.set(key, { side, k, q });
+      }
+    };
+    add(this.md.book.b, 1); add(this.md.book.a, -1);
+    if (bins.size < 6) return;
+    const sizes = [...bins.values()].map(x => x.q).sort((a, b) => a - b), thr = (sizes[sizes.length >> 1] || 0) * this.mult;
+    const px = this.last || this.md.lastPrice, near = Math.max(row * 8, px * 0.002);
+
+    for (const [key, b] of bins) {
+      const L = this.lv.get(key);
+      if (L) {
+        if (b.q > L.size * 1.15 && L.traded > L.tradedAtLast) L.refills++;
+        L.tradedAtLast = L.traded; L.size = b.q; L.max = Math.max(L.max, b.q);
+        if (L.traded >= L.max * 1.5 && L.refills >= 1 && now - L.iceAt > 60_000) {
+          L.iceAt = now;
+          this.emit({ t: now, p: b.k * row, kind: 'ice', side: b.side, q: L.traded, refills: L.refills });
+        }
+      } else if (b.q >= thr && thr > 0) {
+        this.lv.set(key, { side: b.side, first: now, max: b.q, size: b.q, traded: 0, tradedAtLast: 0, refills: 0, iceAt: 0 });
+      }
+    }
+    for (const [key, L] of this.lv) {
+      const b = bins.get(key), k = +key.slice(1), p = k * row;
+      if (b && b.q >= L.max * 0.2) continue;
+      if (Math.abs(p - px) <= near && now - L.first > 1500) {
+        if (L.traded >= L.max * 0.6) this.emit({ t: now, p, kind: 'fill', side: L.side, q: L.max });
+        else if (L.traded < L.max * 0.25) this.emit({ t: now, p, kind: 'pull', side: L.side, q: L.max });
+      }
+      this.lv.delete(key);
+    }
+  }
+TypeScript// In web/src/components/Docks.tsx, replace the binning in DomDock (lines 22-35) with:
+  const bk = new Map<number, [number, number]>(); let mx = 1;
+  for (const [p, q] of bids) { const k = Math.round(p / row); const e = bk.get(k) || [0, 0]; e[0] += q; bk.set(k, e); }
+  for (const [p, q] of asks) { const k = Math.round(p / row); const e = bk.get(k) || [0, 0]; e[1] += q; bk.set(k, e); }
+  for (const e of bk.values()) mx = Math.max(mx, e[0], e[1]);
+  const lb = lastBar(), base = Math.round(px / row), vol = new Map<number, number>();
+  if (lb) for (const [k, [s, b]] of lb.fp) { const kk = Math.round((k * lb.fp ? k * row : 0) / row); vol.set(kk, (vol.get(kk) || 0) + s + b); }

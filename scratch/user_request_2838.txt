@@ -1,0 +1,1405 @@
+<USER_REQUEST>
+1. Root-Cause Audit of Accuracy & Data Consistency IssuesA. Data Feed & Aggregation Inconsistencies (server/ & web/src/data/)Coinbase Aggressor Side Inverted (server/src/feeds/exchanges.ts):In Coinbase's matches WebSocket channel, "side": "buy" means the maker was a buy order, so the taker (aggressor) was a seller (-1). However, coinbase() was mapping m.side === 'sell' ? 1 : -1 properly in one place while seedKlines and estSplit in web/src/chart/engine.ts failed to mark Coinbase, Gate.io, and Bybit historical candles as est: true when binance wasn't in the venue string.   Historical Kline Seeding Overwrites / Boundary Overlap (web/src/data/bars.ts & server/src/history.ts):In BarBuilder.seedKlines(), klines were only prepended for x.t < first (this.bars[0]?.t), leaving a gap or partial bar at this.bars[0] when this.md.ticks started mid-bar! Worse, if a user subscribed mid-minute, the first tick-built bar had partial volume while the exchange kline for that same minute had the full minute's OHLCV.   In BarBuilder.add(), when a live tick arrived on a bar seeded from klines (c.k === true), if (bt === c.t) { c.k = false; fresh = false; } kept the kline's full-bar volume (c.v, c.b, c.s) and added the incoming live ticks on top of it—double-counting volume and corrupting Delta/CVD on the live transition bar.   Sweep Cluster (aggMs) Drops Final Cluster & Misassigns Bar (web/src/data/bars.ts):In BarBuilder.add(), live ticks arriving via md.on('tk') call this.B.add(t) one by one without calling flushCluster() at the end of the batch (ChartPage.tsx line 93: for (const t of d) this.B.add(t)). Any big sweep at the end of a tick batch remained stuck in this.cl until another trade arrived, or got flushed into a later bar.   VWAP & CVD Calculation Flaws (web/src/data/bars.ts):buildSeries() accumulated cvd across the entire array from bar 0 (which changes depending on how many klines loaded) rather than anchoring session CVD at the UTC day boundary (dd !== day), causing CVD values to jump wildly when klines finished loading asynchronously.   buildSeries() used (c.h + c.l + c.c) / 3 * c.v for VWAP even when a bar had exact tick-level footprint data (c.fp), instead of using the true tick-level volume-weighted price $\sum (p \cdot v) / \sum v$.   B. Fixed Range Volume Profile (fixedvp) & Session/Visible Volume Profile Bugs (web/src/chart/drawings.ts & engine.ts)Fixed Range Volume Profile (fixedvp) Distorts Volume & POC via Artificial 3-Bin Smoothing (web/src/chart/drawings.ts):In drawings.ts (lines 480–495), fixedvp ran a smoothing filter (rows[r].smoothVol = prev * 0.22 + rows[r].totalVol * 0.56 + next * 0.22) and then computed POC, Value Area (VAH/VAL), and Total Volume from smoothVol instead of actual traded volume (totalVol)! This shifted the Point of Control (POC) away from the true highest-volume price level and falsified VAH/VAL.   Furthermore, fixedvp binned prices into an arbitrary numRows = Math.round((yBot - yTop) / 2.8) floating-point slice instead of aligning to the instrument's tick/row grid (V.row), causing aliasing artifacts where two footprint levels landed in one bin while the adjacent bin got zero.   Visible / Daily Volume Profile (renderSingleProfile in web/src/chart/engine.ts):Asymmetric Value Area Tie-Breaking: In engine.ts (line 459), if (upVol > dnVol || dn < 0) biased ties downward, whereas in levels.ts (profileOf, line 31), if (up >= dn) biased ties upward! Standard Market Profile / DeepCharts auction theory expands Value Area by comparing two-row steps or breaking ties toward the side closer to the middle / higher volume consistently, and vahPrice / valPrice should represent the top of the upper VA bin and bottom of the lower VA bin.   Bin Center Offset: In renderSingleProfile, price: (binKey + (kGroup - 1) / 2) * row shifted thePOC price by (kGroup - 1) / 2 * row away from the actual k * row footprint key when zoomed out (kGroup > 1), causing the POC label on the right Volume Profile to disagree with the yellow POC box on the Footprint chart and the rangeStats POC in drawing cards.   C. Liquidity Heatmap & DOM Alignment Bugs (server/src/market.ts, web/src/chart/engine.ts, web/src/components/Docks.tsx)Price Binning Mismatch (Math.floor vs Math.round):BarBuilder.add() bins footprint levels using Math.round(p / this.row) (so key k is centered at k * row, spanning [ (k - 0.5)*row, (k + 0.5)*row ]).   However, Market.sampleHeat() in server/src/market.ts binned resting order book depth using Math.floor(p / row) * row, and engine.ts drew heatmap rectangles at yOf(p + row) with height rowH, shifting every heatmap liquidity band by 0.5 * row relative to candles, footprints, and the price axis.   Similarly, the DOM ladder strip in engine.ts (line 262) and DomDock in Docks.tsx (line 26) used Math.floor(p / row) and plotted at (k + 0.5) * row, causing resting bids/asks to sit half a row off from actual price levels.   Snapshot Heatmap Downsampling (server/src/market.ts):Market.snapshot() filtered heatmap columns with if (c.t >= since && c.t - lastT >= 2900), dropping 2 out of every 3 seconds of heatmap history on initial page load or symbol switch, whereas live updates (hm) pushed every 1 second. This created a visible density/resolution jump on the heatmap at the point where the user connected.   D. Footprint & Stacked Imbalance Bugs (web/src/chart/engine.ts)Footprint Row Grouping Shifts Price (drawFootprint in engine.ts):When mul > 1 (auto-grouping rows when zoomed out), drawFootprint computed rk = Math.floor(k / mul) (which for negative or misaligned k or mul > 1 shifts the center) and drew the cell top at yOf((rk + 1) * mul * row - row / 2) instead of centering on the actual price k * row.   Diagonal Imbalance Comparison Direction (drawFootprint & drawImbalanceZones in engine.ts):In standard order-flow footprint analysis (per DeepCharts Footprint documentation), a Buy (Ask) Imbalance at price $P_i$ compares aggressive Buy volume at $P_i$ against aggressive Sell (Bid) volume one tick below at $P_{i-1}$: $\text{Buy}(P_i) \ge \text{Ratio} \times \text{Sell}(P_{i-1})$.A Sell (Bid) Imbalance at price $P_{i-1}$ compares aggressive Sell volume at $P_{i-1}$ against aggressive Buy volume one tick above at $P_i$: $\text{Sell}(P_{i-1}) \ge \text{Ratio} \times \text{Buy}(P_i)$.However, drawImbalanceZones in engine.ts (line 598) checked ks[j] === ks[j - 1] + 1 on raw ungrouped c.fp keys even when ticks skipped a sub-row, and required cur![1] > prev[0] * ratio without handling zero opposite-side volume cleanly when minV === 0 (any tiny 0.001 print over 0 triggered a false imbalance!).   2. Complete Corrected Code by FileFile 1: server/src/market.tsFixes:Aligns sampleHeat() and bookTop() price binning to Math.round(p / row) * row so heatmap bands, DOM levels, and footprint cells share the exact same price centers.Preserves full 1-second heatmap resolution in snapshot() for the recent window so there is no visual density discontinuity between snapshot and live columns.TypeScript/**
+ * MarketHub — one Market per symbol.
+ *  • merges trades from every venue into one tape (each tick tagged with its venue index)
+ *  • keeps a compressed tick history (per second / price / side / venue; big prints kept individually)
+ *  • maintains the order book and samples a heatmap column every second
+ *  • collects liquidations, open interest and funding
+ *  • pushes batched updates to subscribed WebSocket clients
+ */
+import type { Deriv, FeedEvents, HeatCol, Liq, Side, SymbolDef, Tick, Trade } from './types.ts';
+import { SYMBOLS, SYMBOL_MAP } from './symbols.ts';
+import { startSource, sourceLabel, type Running } from './feeds/exchanges.ts';
+import { startDerivs } from './feeds/derivs.ts';
+import { simGen } from './feeds/sim.ts';
+import { persist } from './store/ticks.ts';
+import { log } from './log.ts';
+
+export interface Client { id: number; send(msg: string): void; subs: Set<string> }
+
+const HISTORY_MS = (Number(process.env.HISTORY_HOURS) || 8) * 3_600_000;
+const HEAT_MS = (Number(process.env.HEAT_MINUTES) || 120) * 60_000;
+const SNAP_HEAT_MS = 30 * 60_000;
+const SNAP_TICK_MS = (Number(process.env.SNAPSHOT_HOURS) || 2) * 3_600_000;
+const LIQ_MS = 24 * 3_600_000;
+const DERIV_MS = 48 * 3_600_000;
+const HEAT_ROWS = 120;
+
+const r6 = (x: number) => +x.toPrecision(8);
+
+class Market {
+  readonly def: SymbolDef;
+  readonly venues: string[];
+  ticks: Tick[] = [];
+  heat: HeatCol[] = [];
+  liqs: Liq[] = [];
+  deriv: Deriv[] = [];
+  bids = new Map<number, number>();
+  asks = new Map<number, number>();
+  last = 0;
+  started = false;
+  runners: Running[] = [];
+  subs = new Set<Client>();
+  status = new Map<string, { ok: boolean; note?: string }>();
+  private pending: Tick[] = [];
+  private pendingLiq: Liq[] = [];
+  private sec = 0;
+  private secAgg = new Map<string, Tick>();
+  private bigQ = 0;
+
+  constructor(def: SymbolDef) { this.def = def; this.venues = def.sources.map(sourceLabel); }
+
+  start(ev: FeedEvents): void {
+    if (this.started) return;
+    this.started = true;
+    if (this.def.sources[0].ex === 'sim') {
+      const g = simGen(this.def);
+      const hist = g.history(48 * 60);
+      for (const t of hist) this.addTrade(t, false);
+      this.flushSecond();
+      let j = 0;
+      for (let t = Date.now() - 60 * 60_000; t < Date.now(); t += 1000) {
+        while (j < hist.length - 1 && hist[j + 1].t <= t) j++;
+        const bk = g.book(hist[j].p, t);
+        this.applyBook(bk.bids, bk.asks, true);
+        this.sampleHeat(t, hist[j].p);
+      }
+      for (let i = 0; i < hist.length; i += 400) {
+        const h = hist[i], s: Side = Math.random() < 0.5 ? 1 : -1;
+        this.liqs.push({ t: h.t, p: h.p, q: Math.exp(Math.random() * 3) * 0.2, s, v: 0 });
+      }
+    }
+    this.def.sources.forEach((s, i) => {
+      this.status.set(sourceLabel(s), { ok: false, note: 'connecting' });
+      try { this.runners.push(startSource(this.def, i, ev)); }
+      catch (e) { log.error(`start ${this.def.id}/${s.ex}: ${(e as Error).message}`); }
+    });
+    if (this.def.volume === 'real') {
+      try { this.runners.push(startDerivs(this.def, ev)); } catch (e) { log.error(`derivs ${this.def.id}: ${(e as Error).message}`); }
+    }
+    log.info(`market ${this.def.id} started (${this.def.venues})`);
+  }
+
+  addTrade(t: Trade, live = true): void {
+    if (!(t.p > 0) || !isFinite(t.q) || t.q < 0) return;
+    const tkSize = this.def.tick || 1e-8;
+    const normP = +(Math.round(t.p / tkSize) * tkSize).toFixed(this.def.dec);
+    this.last = normP;
+    const vi = Math.max(0, this.venues.indexOf(t.ex));
+    const tick: Tick = [t.t, normP, t.q, t.s, vi];
+    if (live) this.pending.push(tick);
+    const sec = Math.floor(t.t / 1000);
+    if (sec !== this.sec) { this.flushSecond(); this.sec = sec; }
+    if (!this.bigQ) this.bigQ = Math.max(0.00001, this.def.bigQty ? Math.min(this.def.bigQty * 0.25, (this.def.bigUsd * 0.1) / normP) : (this.def.bigUsd * 0.1) / normP);
+    if (t.q >= this.bigQ) { this.ticks.push(tick); if (live) persist.tick(this.def.id, tick); return; }
+    const k = normP + '|' + t.s + '|' + vi;
+    const a = this.secAgg.get(k);
+    if (a) a[2] = r6(a[2] + t.q); else this.secAgg.set(k, [t.t, normP, t.q, t.s, vi]);
+  }
+
+  addLiq(l: { t: number; p: number; q: number; s: Side; ex: string }): void {
+    if (!(l.p > 0) || !(l.q > 0)) return;
+    const x: Liq = { t: l.t || Date.now(), p: l.p, q: r6(l.q), s: l.s, v: Math.max(0, this.venues.indexOf(l.ex)) };
+    this.liqs.push(x); this.pendingLiq.push(x);
+  }
+
+  addDeriv(d: Deriv): void { this.deriv.push(d); }
+
+  private flushSecond(): void {
+    if (!this.secAgg.size) return;
+    for (const tk of this.secAgg.values()) { this.ticks.push(tk); persist.tick(this.def.id, tk); }
+    this.secAgg.clear();
+  }
+
+  applyBook(bids: [number, number][], asks: [number, number][], snapshot: boolean): void {
+    if (snapshot) { this.bids.clear(); this.asks.clear(); }
+    for (const [p, q] of bids) q > 0 ? this.bids.set(p, q) : this.bids.delete(p);
+    for (const [p, q] of asks) q > 0 ? this.asks.set(p, q) : this.asks.delete(p);
+    // Prune crossed book entries caused by async incremental depth updates
+    if (this.bids.size && this.asks.size && !snapshot) {
+      const bb = this.bestBid(), ba = this.bestAsk();
+      if (bb >= ba && this.last > 0) {
+        for (const p of this.bids.keys()) if (p > this.last + this.def.row * 2) this.bids.delete(p);
+        for (const p of this.asks.keys()) if (p < this.last - this.def.row * 2) this.asks.delete(p);
+      }
+    }
+  }
+
+  bestBid(): number { let b = -Infinity; for (const p of this.bids.keys()) if (p > b) b = p; return b; }
+  bestAsk(): number { let a = Infinity; for (const p of this.asks.keys()) if (p < a) a = p; return a; }
+
+  bookTop(n: number, row: number): { b: [number, number][]; a: [number, number][] } {
+    const bin = (m: Map<number, number>, side: 1 | -1) => {
+      const agg = new Map<number, number>();
+      for (const [p, q] of m) {
+        const k = row ? +(Math.round(p / row) * row).toFixed(this.def.dec) : p;
+        agg.set(k, (agg.get(k) || 0) + q);
+      }
+      return [...agg.entries()]
+        .sort((x, y) => side > 0 ? y[0] - x[0] : x[0] - y[0])
+        .slice(0, n)
+        .map(([p, q]) => [p, r6(q)] as [number, number]);
+    };
+    return { b: bin(this.bids, 1), a: bin(this.asks, -1) };
+  }
+
+  sampleHeat(now: number, midHint?: number): HeatCol | null {
+    if (!this.bids.size && !this.asks.size) return null;
+    const bb = this.bestBid(), ba = this.bestAsk();
+    const mid = midHint ?? (isFinite(bb) && isFinite(ba) && bb < ba ? (bb + ba) / 2 : this.last);
+    if (!mid) return null;
+    const row = this.def.row, lo = mid - row * HEAT_ROWS, hi = mid + row * HEAT_ROWS;
+    const agg = new Map<number, [number, Side]>();
+    const add = (m: Map<number, number>, s: Side) => {
+      for (const [p, q] of m) {
+        if (p < lo || p > hi) continue;
+        // Center-bin on exact row multiples to match BarBuilder footprint keys
+        const k = +(Math.round(p / row) * row).toFixed(this.def.dec);
+        const e = agg.get(k);
+        if (e) {
+          if (e[1] === s) e[0] += q;
+          else if (q > e[0]) { e[0] = q - e[0]; e[1] = s; }
+          else e[0] -= q;
+        } else {
+          agg.set(k, [q, s]);
+        }
+      }
+    };
+    add(this.bids, 1); add(this.asks, -1);
+    const col: HeatCol = {
+      t: now,
+      l: [...agg.entries()].filter(([, [q]]) => q > 0).map(([p, [q, s]]) => [p, +q.toPrecision(4), s]),
+    };
+    this.heat.push(col);
+    return col;
+  }
+
+  trim(now: number): void {
+    if (this.last > 0) this.bigQ = Math.max(0.00001, this.def.bigQty ? Math.min(this.def.bigQty * 0.25, (this.def.bigUsd * 0.1) / this.last) : (this.def.bigUsd * 0.1) / this.last);
+    const cut = now - (this.def.cls === 'demo' ? 48 * 3_600_000 : HISTORY_MS);
+    const drop = <T>(a: T[], t: (x: T) => number, c: number) => { let i = 0; while (i < a.length && t(a[i]) < c) i++; if (i) a.splice(0, i); };
+    drop(this.ticks, x => x[0], cut);
+    drop(this.heat, x => x.t, now - HEAT_MS);
+    drop(this.liqs, x => x.t, now - LIQ_MS);
+    drop(this.deriv, x => x.t, now - DERIV_MS);
+  }
+
+  takePending(): Tick[] { const p = this.pending; this.pending = []; return p; }
+  takeLiqs(): Liq[] { const p = this.pendingLiq; this.pendingLiq = []; return p; }
+
+  snapshot(): string {
+    this.flushSecond();
+    const now = Date.now(), since = now - SNAP_HEAT_MS, recentCutoff = now - 10 * 60_000, tickSince = now - SNAP_TICK_MS;
+    let i0 = this.ticks.length; while (i0 > 0 && this.ticks[i0 - 1][0] >= tickSince) i0--;
+    const heat: HeatCol[] = [];
+    let lastT = 0;
+    for (const c of this.heat) {
+      if (c.t < since) continue;
+      // Full 1s resolution for last 10m; 2s resolution for older history
+      const minGap = c.t >= recentCutoff ? 900 : 1900;
+      if (c.t - lastT >= minGap) { heat.push(c); lastT = c.t; }
+    }
+    return JSON.stringify({
+      t: 'snap', sym: this.def.id, ticks: this.ticks.slice(i0), heat,
+      book: this.bookTop(80, 0), status: Object.fromEntries(this.status),
+      venues: this.venues, liqs: this.liqs, deriv: this.deriv,
+    });
+  }
+}
+
+export class MarketHub implements FeedEvents {
+  markets = new Map<string, Market>();
+
+  constructor() {
+    for (const d of SYMBOLS) this.markets.set(d.id, new Market(d));
+    setInterval(() => this.flushTrades(), 100);
+    setInterval(() => this.flushBooks(), 250);
+    setInterval(() => this.flushHeat(), 1000);
+    setInterval(() => { const n = Date.now(); for (const m of this.markets.values()) m.trim(n); }, 60_000);
+    const boot = (process.env.RECORD || 'BTCUSD,ETHUSD,XAUUSDT,XAGUSDT,GOLD,SILVER,SP500,NDX,DEMO').split(',').map(s => s.trim()).filter(Boolean);
+    for (const id of boot) this.ensure(id);
+  }
+
+  ensure(id: string): Market | undefined {
+    const m = this.markets.get(id);
+    if (m && !m.started) m.start(this);
+    return m;
+  }
+
+  trade(id: string, t: Trade) { this.markets.get(id)?.addTrade(t); }
+  book(id: string, b: [number, number][], a: [number, number][], snap: boolean) { this.markets.get(id)?.applyBook(b, a, snap); }
+  liq(id: string, l: { t: number; p: number; q: number; s: Side; ex: string }) { this.markets.get(id)?.addLiq(l); }
+  deriv(id: string, d: Deriv) {
+    const m = this.markets.get(id); if (!m) return;
+    m.addDeriv(d);
+    if (m.subs.size) this.broadcast(m, JSON.stringify({ t: 'dv', sym: id, d }));
+  }
+  status(id: string, ex: string, ok: boolean, note?: string) {
+    const m = this.markets.get(id); if (!m) return;
+    m.status.set(ex, { ok, note });
+    this.broadcast(m, JSON.stringify({ t: 'st', sym: id, status: Object.fromEntries(m.status) }));
+  }
+
+  subscribe(c: Client, id: string) {
+    const m = this.ensure(id);
+    if (!m) return c.send(JSON.stringify({ t: 'err', msg: `unknown symbol ${id}` }));
+    m.subs.add(c); c.subs.add(id);
+    c.send(m.snapshot());
+  }
+  unsubscribe(c: Client, id: string) { this.markets.get(id)?.subs.delete(c); c.subs.delete(id); }
+  drop(c: Client) { for (const id of c.subs) this.markets.get(id)?.subs.delete(c); c.subs.clear(); }
+
+  private broadcast(m: Market, msg: string) { for (const c of m.subs) c.send(msg); }
+
+  private flushTrades() {
+    for (const m of this.markets.values()) {
+      const p = m.takePending();
+      if (p.length && m.subs.size) this.broadcast(m, JSON.stringify({ t: 'tk', sym: m.def.id, d: p }));
+      const l = m.takeLiqs();
+      if (l.length && m.subs.size) this.broadcast(m, JSON.stringify({ t: 'lq', sym: m.def.id, d: l }));
+    }
+  }
+  private flushBooks() {
+    for (const m of this.markets.values()) {
+      if (!m.subs.size || (!m.bids.size && !m.asks.size)) continue;
+      this.broadcast(m, JSON.stringify({ t: 'bk', sym: m.def.id, ...m.bookTop(80, 0) }));
+    }
+  }
+  private flushHeat() {
+    const now = Date.now();
+    for (const m of this.markets.values()) {
+      if (!m.started) continue;
+      const col = m.sampleHeat(now);
+      if (col) { persist.heat(m.def.id, col); if (m.subs.size) this.broadcast(m, JSON.stringify({ t: 'hm', sym: m.def.id, c: col })); }
+    }
+  }
+
+  async ticksRange(id: string, from: number, to: number): Promise<Tick[]> {
+    const m = this.markets.get(id); if (!m) return [];
+    const mem = m.ticks;
+    const memStart = mem.length ? mem[0][0] : Infinity;
+    let out: Tick[] = [];
+    if (from < memStart) out = await persist.ticksRange(id, from, Math.min(to, memStart - 1));
+    if (to >= memStart) { for (const t of mem) if (t[0] >= from && t[0] <= to) out.push(t); }
+    return out;
+  }
+
+  info() {
+    return SYMBOLS.map(d => {
+      const m = this.markets.get(d.id)!;
+      return { id: d.id, name: d.name, desc: d.desc, cls: d.cls, tick: d.tick, row: d.row, dec: d.dec, bigUsd: d.bigUsd, bigQty: d.bigQty, contractUnit: d.contractUnit, volume: d.volume, venues: d.venues,
+        hasBook: d.bookFrom >= 0, last: m.last, live: m.started && [...m.status.values()].some(s => s.ok), recordedFrom: m.ticks[0]?.[0] ?? null };
+    });
+  }
+
+  def(id: string) { return SYMBOL_MAP.get(id); }
+}
+File 2: web/src/data/bars.tsFixes:Prevents double-counting volume/delta when transitioning from a seeded historical kline (c.k === true) to live ticks on the same timestamp (bt === c.t).Merges partial first tick-bar with historical kline OHLC (Math.max(h), Math.min(l), o from kline open) without duplicating volume.Resets session cvd at UTC midnight boundaries (dd !== day) alongside vwap, and computes exact footprint-weighted VWAP when footprint cells exist.TypeScriptimport type { Bar, BarSpec, BigTradeConfig, BigTradeMode, KBar, Side, Tick } from '../lib/types';
+
+export class BarBuilder {
+  bars: Bar[] = [];
+  readonly spec: BarSpec;
+  readonly row: number;
+  readonly bigConfig: BigTradeConfig;
+  readonly aggMs: number;
+  private n = 0;
+  private cl: { s: Side; t0: number; tl: number; q: number; pq: number; bar: Bar } | null = null;
+  private recentTradeNotionals: number[] = [];
+  private cachedAutoThreshold: number = 0;
+  private tradesSinceRecalc: number = 0;
+
+  constructor(spec: BarSpec, row: number, bigFilter: number | BigTradeConfig, aggMs = 0) {
+    this.spec = spec;
+    this.row = row;
+    this.bigConfig = typeof bigFilter === 'number'
+      ? { mode: 'usd', bigUsd: bigFilter, bigQty: 1, autoPct: 0.99 }
+      : { mode: bigFilter.mode || 'usd', bigUsd: bigFilter.bigUsd, bigQty: bigFilter.bigQty ?? 1, autoPct: bigFilter.autoPct || 0.99 };
+    this.aggMs = aggMs;
+    this.cachedAutoThreshold = this.bigConfig.bigUsd;
+  }
+
+  get bigUsd() { return this.bigConfig.bigUsd; }
+  get bigQty() { return this.bigConfig.bigQty; }
+  get bigMode(): BigTradeMode { return this.bigConfig.mode; }
+  getAutoThreshold(): number { return this.cachedAutoThreshold; }
+
+  static ms(spec: BarSpec) { return spec.kind === 'time' ? spec.sec * 1000 : 0; }
+
+  isBig(q: number, p: number): boolean {
+    const usd = q * p;
+    if (usd > 0) {
+      if (this.recentTradeNotionals.length >= 1000) {
+        this.recentTradeNotionals.shift();
+      }
+      this.recentTradeNotionals.push(usd);
+      this.tradesSinceRecalc++;
+      if (this.tradesSinceRecalc >= 25 || !this.cachedAutoThreshold) {
+        this.recalcAutoThreshold();
+      }
+    }
+
+    if (this.bigConfig.mode === 'qty') {
+      return q >= this.bigConfig.bigQty;
+    }
+    if (this.bigConfig.mode === 'auto') {
+      const thresh = this.cachedAutoThreshold || this.bigConfig.bigUsd;
+      return usd >= thresh;
+    }
+    return usd >= this.bigConfig.bigUsd;
+  }
+
+  private recalcAutoThreshold() {
+    this.tradesSinceRecalc = 0;
+    const len = this.recentTradeNotionals.length;
+    if (len < 15) {
+      this.cachedAutoThreshold = this.bigConfig.bigUsd;
+      return;
+    }
+    const sorted = [...this.recentTradeNotionals].sort((a, b) => a - b);
+    const pct = Math.min(0.999, Math.max(0.5, this.bigConfig.autoPct || 0.99));
+    const idx = Math.min(len - 1, Math.floor(len * pct));
+    this.cachedAutoThreshold = Math.max(100, Math.round(sorted[idx]));
+  }
+
+  add(tk: Tick): void {
+    const [t, p, q, s, vi] = tk;
+    let c = this.bars[this.bars.length - 1];
+    let fresh = !c || c.k;
+    if (!fresh) {
+      const sp = this.spec;
+      if (sp.kind === 'time') fresh = Math.floor(t / (sp.sec * 1000)) * sp.sec * 1000 > c.t;
+      else if (sp.kind === 'vol') fresh = c.v >= sp.size;
+      else fresh = this.n >= sp.count;
+    }
+    if (c && c.k && this.spec.kind === 'time') {
+      const bt = Math.floor(t / (this.spec.sec * 1000)) * this.spec.sec * 1000;
+      if (bt === c.t) {
+        // Transitioning a kline-seeded bar into a live tick bar: reset kline volume so live ticks don't double-count
+        c.k = false;
+        c.est = false;
+        c.v = 0; c.b = 0; c.s = 0;
+        fresh = false;
+      } else if (bt < c.t) return;
+    }
+    if (fresh) {
+      if (this.aggMs) this.flushCluster();
+      const bt = this.spec.kind === 'time' ? Math.floor(t / (this.spec.sec * 1000)) * this.spec.sec * 1000 : t;
+      c = { t: bt, o: p, h: p, l: p, c: p, v: 0, b: 0, s: 0, fp: new Map(), big: [] };
+      this.bars.push(c); this.n = 0;
+    }
+    if (p > c.h) c.h = p; if (p < c.l) c.l = p; c.c = p;
+    c.v += q; s > 0 ? (c.b += q) : (c.s += q); this.n++;
+    const k = Math.round(p / this.row);
+    let cell = c.fp.get(k); if (!cell) { cell = [0, 0]; c.fp.set(k, cell); }
+    cell[s > 0 ? 1 : 0] += q;
+    if (vi != null) {
+      const vd = (c.vd ||= []), vv = (c.vv ||= []);
+      vd[vi] = (vd[vi] || 0) + (s > 0 ? q : -q); vv[vi] = (vv[vi] || 0) + q;
+    }
+    if (!this.aggMs) { if (this.isBig(q, p)) c.big.push(tk); return; }
+    const cl = this.cl;
+    if (cl && cl.s === s && cl.bar === c && t - cl.tl <= this.aggMs) { cl.q += q; cl.pq += p * q; cl.tl = t; }
+    else { this.flushCluster(); this.cl = { s, t0: t, tl: t, q, pq: p * q, bar: c }; }
+  }
+
+  flushCluster() {
+    const cl = this.cl; if (!cl) return; this.cl = null;
+    const p = cl.pq / cl.q;
+    if (this.isBig(cl.q, p)) cl.bar.big.push([cl.t0, +p.toPrecision(10), +cl.q.toPrecision(8), cl.s]);
+  }
+
+  addAll(ticks: Tick[], from = 0) {
+    for (let i = from; i < ticks.length; i++) this.add(ticks[i]);
+    if (this.aggMs) this.flushCluster();
+  }
+
+  seedKlines(k: KBar[], estimated: boolean) {
+    if (this.spec.kind !== 'time' || !k.length) return;
+    const firstBar = this.bars[0];
+    const first = firstBar?.t ?? Infinity;
+    const older: Bar[] = [];
+    for (const x of k) {
+      if (x.t < first) {
+        older.push({ ...x, fp: new Map(), big: [], k: true, est: estimated });
+      } else if (firstBar && x.t === first && !firstBar.k) {
+        // Merge kline open/high/low into the partial first tick bar if ticks started mid-bar
+        firstBar.o = x.o;
+        firstBar.h = Math.max(firstBar.h, x.h);
+        firstBar.l = Math.min(firstBar.l, x.l);
+        if (x.v > firstBar.v && !estimated) {
+          const diffB = Math.max(0, x.b - firstBar.b);
+          const diffS = Math.max(0, x.s - firstBar.s);
+          firstBar.b += diffB;
+          firstBar.s += diffS;
+          firstBar.v = firstBar.b + firstBar.s;
+        }
+      }
+    }
+    this.bars = older.concat(this.bars);
+  }
+}
+
+export interface Series {
+  length: number;
+  time: number[]; open: number[]; high: number[]; low: number[]; close: number[]; volume: number[];
+  buy: number[]; sell: number[]; delta: number[]; cvd: number[]; vwap: number[]; bigBuy: number[]; bigSell: number[];
+}
+
+export function buildSeries(bars: Bar[], row = 0): Series {
+  const n = bars.length;
+  const d: Series = {
+    length: n, time: new Array(n), open: new Array(n), high: new Array(n), low: new Array(n), close: new Array(n),
+    volume: new Array(n), buy: new Array(n), sell: new Array(n), delta: new Array(n), cvd: new Array(n),
+    vwap: new Array(n), bigBuy: new Array(n), bigSell: new Array(n),
+  };
+  let cv = 0, pv = 0, vv = 0, day = -1;
+  for (let i = 0; i < n; i++) {
+    const c = bars[i];
+    const dd = Math.floor(c.t / 86_400_000);
+    if (dd !== day) {
+      day = dd;
+      pv = 0;
+      vv = 0;
+      // Reset session CVD on UTC day transition only when crossing days across history
+      if (i > 0) cv = 0;
+    }
+    d.time[i] = c.t; d.open[i] = c.o; d.high[i] = c.h; d.low[i] = c.l; d.close[i] = c.c; d.volume[i] = c.v;
+    d.buy[i] = c.b; d.sell[i] = c.s; d.delta[i] = c.est ? 0 : c.b - c.s; cv += d.delta[i]; d.cvd[i] = cv;
+    if (row > 0 && c.fp && c.fp.size > 0) {
+      for (const [k, [s, b]] of c.fp) {
+        const q = s + b;
+        pv += (k * row) * q;
+        vv += q;
+      }
+    } else {
+      pv += ((c.h + c.l + c.c) / 3) * c.v;
+      vv += c.v;
+    }
+    d.vwap[i] = vv ? pv / vv : c.c;
+    let bb = 0, bs = 0; for (const t of c.big) t[3] > 0 ? (bb += t[2]) : (bs += t[2]);
+    d.bigBuy[i] = bb; d.bigSell[i] = bs;
+  }
+  return d;
+}
+
+export const specLabel = (s: BarSpec) => s.kind === 'time' ? (s.sec < 60 ? `${s.sec}s` : s.sec < 3600 ? `${s.sec / 60}m` : s.sec < 86400 ? `${s.sec / 3600}h` : `${s.sec / 86400}D`) : s.kind === 'vol' ? `${s.size} Vol` : `${s.count} Tick`;
+export const BAR_SPECS: BarSpec[] = [
+  { kind: 'time', sec: 5 }, { kind: 'time', sec: 15 }, { kind: 'time', sec: 30 },
+  { kind: 'time', sec: 60 }, { kind: 'time', sec: 180 }, { kind: 'time', sec: 300 }, { kind: 'time', sec: 900 }, { kind: 'time', sec: 1800 },
+  { kind: 'time', sec: 3600 }, { kind: 'time', sec: 14400 }, { kind: 'time', sec: 86400 },
+  { kind: 'tick', count: 100 }, { kind: 'tick', count: 500 }, { kind: 'tick', count: 1000 },
+  { kind: 'vol', size: 50 }, { kind: 'vol', size: 250 }, { kind: 'vol', size: 1000 },
+];
+export const specKey = (s: BarSpec) => s.kind === 'time' ? `t:${s.sec}` : s.kind === 'vol' ? `v:${s.size}` : `k:${s.count}`;
+export const parseSpec = (k: string): BarSpec => { const [a, b] = k.split(':'); return a === 't' ? { kind: 'time', sec: +b } : a === 'v' ? { kind: 'vol', size: +b } : { kind: 'tick', count: +b }; };
+File 3: web/src/chart/engine.tsFixes:Live Tick Sweep Flush: Calls this.B.addAll(d) instead of for (const t of d) this.B.add(t) so flushCluster() is guaranteed to run after every incoming WebSocket tick batch.estSplit() Detection: Properly identifies non-Binance kline sources (hyperliquid|bybit|coinbase|gate) so historical candles without taker buy/sell split are flagged est: true and do not pollute Delta or CVD.Liquidity Heatmap Alignment: Draws each heatmap cell centered vertically on p (yOf(p + row * 0.5) to yOf(p - row * 0.5)) with adaptive dynamic contrast and time-column bridging so there are zero vertical or horizontal gaps.DOM Ladder & Book Walls Alignment: Uses Math.round(p / row) and centers bars at yOf(k * row).Footprint & Diagonal Stacked Imbalances: Fixes grouped row centering ((rk + 0.5) * mul * row) and diagonal imbalance detection (requires meaningful minimum volume or non-zero opposite volume, and supports grouped footprint rows).DeepCharts Split Volume Profile (renderSingleProfile): Uses volume-weighted price center per bin so POC price is 100% exact even when zoomed out (kGroup > 1), and uses standard Auction Market Theory Value Area expansion (upVol >= dnVol).TypeScript// Replace the changed methods in web/src/chart/engine.ts (or drop into engine.ts):
+
+  /* Inside setMarket(md: MarketData, sym: SymbolInfo): */
+  setMarket(md: MarketData, sym: SymbolInfo) {
+    this.unsub?.();
+    this.md = md; this.sym = sym; this.kKey = ''; this.klines = []; this.smoothPriceY = null;
+    this.view = { cw: DEFAULT_CW[this.opt.style], off: 0, auto: true, y: null };
+    this.unsub = md.on((e, d) => {
+      if (e === 'snap') this.rebuild();
+      else if (e === 'tk' && this.B) { this.B.addAll(d); }
+      this.dirty = true;
+    });
+    this.rebuild();
+  }
+
+  private estSplit() {
+    return !!this.sym && /hyperliquid|bybit|coinbase|gate/i.test(this.sym.venues) && !/binance/i.test(this.sym.venues);
+  }
+
+  series(): Series { return buildSeries(this.bars, this.rowSize()); }
+And replace the Heatmap, DOM Ladder, Footprint, Volume Profile (renderSingleProfile), Stacked Imbalances (drawImbalanceZones), and Walls (drawWalls) sections in web/src/chart/engine.ts with:TypeScript    /* ---------- liquidity heatmap ---------- */
+    if (heat && this.md) {
+      const cols = this.md.heat;
+      let a = 0, b = cols.length - 1; while (a <= b) { const m = (a + b) >> 1; if (cols[m].t < tLo) a = m + 1; else b = m - 1; }
+      const i0 = Math.max(0, a - 1);
+      const sizes: number[] = [];
+      for (let i = i0; i < cols.length && cols[i].t <= tHi && cols[i].t <= tEnd; i++) {
+        for (const l of cols[i].l) if (l[1] > 0) sizes.push(l[1]);
+      }
+      sizes.sort((x, y) => x - y);
+      // Use 98th percentile resting size as reference ceiling so a single spoof order doesn't black out the entire heatmap
+      const p98 = sizes.length ? sizes[Math.min(sizes.length - 1, Math.floor(sizes.length * 0.98))] : 1;
+      const contrast = Math.max(0.2, Math.min(1.0, this.flow.heatContrast || 0.55));
+      const mx = Math.max(1e-9, p98 * (1.25 - contrast * 0.75));
+      const rowH = Math.max(1.2, pxRow);
+      for (let i = i0; i < cols.length && cols[i].t <= tHi && cols[i].t <= tEnd; i++) {
+        const c = cols[i], x = this.timeToX(c.t);
+        const nx = i + 1 < cols.length ? this.timeToX(cols[i + 1].t) : x + Math.max(2, cw * 0.5);
+        const w = Math.max(1.5, Math.min(Math.max(1.5, nx - x), cw * 6) + 0.75);
+        for (const [p, q, s] of c.l) {
+          const yy = yOf(p + row * 0.5);
+          if (yy > mainH || yy + rowH < 0) continue;
+          const ix = Math.min(63, Math.floor(Math.pow(Math.min(1, q / mx), contrast) * 63));
+          if (ix < (this.flow.heatCutoff ?? 4)) continue;
+          ctx.fillStyle = s > 0 ? HEAT_BID[ix] : HEAT_ASK[ix];
+          ctx.fillRect(x, yy, w, rowH + 0.6);
+        }
+      }
+      ctx.lineWidth = 1.5;
+      for (let i = Math.max(first, 1); i <= last; i++) {
+        const p0 = bars[i - 1], c = bars[i];
+        ctx.strokeStyle = c.c >= p0.c ? BULL : '#a47cf2';
+        ctx.beginPath(); ctx.moveTo(xOf(i - 1), yOf(p0.c)); ctx.lineTo(xOf(i), yOf(c.c)); ctx.stroke();
+      }
+      for (let i = first; i <= last; i++) {
+        if (cw < 3 && i % 2) continue;
+        const c = bars[i];
+        ctx.fillStyle = c.b >= c.s ? '#7be36f' : '#b27ae6';
+        ctx.beginPath(); ctx.arc(xOf(i), yOf(c.c), 1.8, 0, 7); ctx.fill();
+      }
+      if (ov.bubbles) for (let i = first; i <= last; i++) for (const t of bars[i].big) this.bubble(xOf(i), yOf(t[1]), t[2], t[1], t[3], true);
+    }
+TypeScript    /* ---------- DOM ladder strip (heatmap) ---------- */
+    if (ladW && this.md) {
+      const lx = plotW; ctx.fillStyle = bg; ctx.fillRect(lx, 0, ladW, mainH);
+      const lv = new Map<number, [number, number]>(); let mx = 1;
+      for (const [p, q] of this.md.book.b) { const k = Math.round(p / row); const e = lv.get(k) || [0, 1]; e[0] += q; lv.set(k, e); }
+      for (const [p, q] of this.md.book.a) { const k = Math.round(p / row); const e = lv.get(k) || [0, -1]; e[0] += q; e[1] = -1; lv.set(k, e); }
+      for (const e of lv.values()) mx = Math.max(mx, e[0]);
+      const step = Math.max(1, Math.ceil(13 / pxRow));
+      ctx.font = `10.5px ${MONO}`; ctx.textBaseline = 'middle';
+      for (const [k, [q, s]] of lv) {
+        if (k % step) continue;
+        const yy = yOf(k * row);
+        if (yy < 6 || yy > mainH - 6) continue;
+        ctx.globalAlpha = 0.35 + 0.65 * Math.min(1, (q / mx) * 2);
+        ctx.fillStyle = s > 0 ? '#1aa51a' : '#6b2fb3';
+        ctx.fillRect(lx, yy - 6.5, 4 + Math.min(1, q / mx) * 30, 13);
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = '#fff';
+        ctx.fillText(fmtQ(q), lx + 3, yy);
+      }
+    }
+TypeScript  private drawFootprint(bars: Bar[], first: number, last: number, xOf: (i: number) => number, yOf: (p: number) => number, row: number, pxRow: number, cw: number) {
+    const ctx = this.ctx, mode = this.opt.fpMode || 'ba', ratio = this.flow.fpRatio || 3, minV = this.flow.fpMinVol || 0;
+    const mul = Math.max(1, Math.ceil(16 / pxRow)), rowPx = pxRow * mul, colW = cw * 0.88, showTxt = cw >= 56 && rowPx >= 11;
+    ctx.textBaseline = 'middle'; ctx.textAlign = 'center';
+    for (let i = first; i <= last; i++) {
+      const c = bars[i], x0 = xOf(i) - colW / 2, up = c.c >= c.o;
+      ctx.fillStyle = up ? BULL : BEAR;
+      ctx.fillRect(x0, yOf(c.h), 2, Math.max(1, yOf(c.l) - yOf(c.h)));
+      const yb = yOf(Math.max(c.o, c.c)); ctx.fillRect(x0 - 1, yb, 5, Math.max(2, yOf(Math.min(c.o, c.c)) - yb));
+      if (!c.fp.size) {
+        ctx.fillStyle = '#ffffff0c'; ctx.fillRect(x0 + 8, yOf(c.h), colW - 10, Math.max(1, yOf(c.l) - yOf(c.h)));
+        if (showTxt) { ctx.fillStyle = '#4a5361'; ctx.font = `10px ${FONT}`; ctx.fillText('no tick data', x0 + colW / 2, (yOf(c.h) + yOf(c.l)) / 2); }
+        continue;
+      }
+      const rows = new Map<number, [number, number]>();
+      for (const [k, [s, b]] of c.fp) { const rk = Math.floor(k / mul); const r = rows.get(rk) || [0, 0]; r[0] += s; r[1] += b; rows.set(rk, r); }
+      let mx = 0, poc = 0, mxD = 1e-12;
+      for (const [rk, r] of rows) {
+        const t = r[0] + r[1];
+        if (t > mx) { mx = t; poc = rk; }
+        mxD = Math.max(mxD, Math.abs(r[1] - r[0]));
+      }
+      const cx0 = x0 + 8, cW = colW - 10, half = cW / 2;
+      const effMinV = minV > 0 ? minV : mx * 0.05;
+      for (const [rk, [s, b]] of rows) {
+        const centerPrice = (rk * mul + (mul - 1) * 0.5) * row;
+        const yy = yOf(centerPrice + (mul * row) * 0.5);
+        const h = Math.max(1, rowPx - 1.5), tot = s + b, d = b - s, fs = Math.min(12, rowPx * 0.72);
+        if (mode === 'delta') {
+          const a = Math.abs(d) / mxD;
+          ctx.fillStyle = d >= 0 ? `rgba(34,197,139,${0.12 + 0.6 * a})` : `rgba(139,92,246,${0.15 + 0.65 * a})`;
+          ctx.fillRect(cx0, yy + 1, cW, h);
+          if (showTxt) { ctx.font = `${a > 0.6 ? '700 ' : ''}${fs}px ${MONO}`; ctx.fillStyle = '#f2f2f2'; ctx.fillText((d > 0 ? '+' : '') + fmtQ(d), cx0 + half, yy + 1 + h / 2); }
+        } else if (mode === 'vol') {
+          ctx.fillStyle = b >= s ? 'rgba(34,197,139,0.45)' : 'rgba(139,92,246,0.5)';
+          ctx.fillRect(cx0, yy + 1, Math.max(3, (tot / mx) * cW), h);
+          if (showTxt) { ctx.font = `${fs}px ${MONO}`; ctx.fillStyle = '#f2f2f2'; ctx.textAlign = 'left'; ctx.fillText(fmtQ(tot), cx0 + 4, yy + 1 + h / 2); ctx.textAlign = 'center'; }
+        } else {
+          const strong = Math.abs(d) / (tot || 1) > 0.45 && tot > mx * 0.35;
+          ctx.fillStyle = b >= s ? (strong ? 'rgba(34,197,139,0.75)' : 'rgba(34,197,139,0.35)') : (strong ? 'rgba(139,92,246,0.8)' : 'rgba(139,92,246,0.38)');
+          ctx.fillRect(cx0, yy + 1, Math.max(4, (tot / mx) * half), h);
+          if (showTxt) {
+            const below = rows.get(rk - 1), above = rows.get(rk + 1);
+            const imbB = !!below && b >= below[0] * ratio && b >= effMinV;
+            const imbS = !!above && s >= above[1] * ratio && s >= effMinV;
+            ctx.font = `${imbS ? '700 ' : ''}${fs}px ${MONO}`; ctx.fillStyle = imbS ? '#ff3df5' : '#e9edf2'; ctx.fillText(fmtQ(s), cx0 + half * 0.5, yy + 1 + h / 2);
+            ctx.font = `${imbB ? '700 ' : ''}${fs}px ${MONO}`; ctx.fillStyle = imbB ? '#00e5ff' : '#e9edf2'; ctx.fillText(fmtQ(b), cx0 + half * 1.5, yy + 1 + h / 2);
+          }
+        }
+        if (rk === poc) { ctx.strokeStyle = '#e6c84a'; ctx.lineWidth = 1.5; ctx.strokeRect(cx0 + 0.5, yy + 1.5, cW - 1, h - 1); ctx.lineWidth = 1; }
+      }
+      if (showTxt) {
+        const dl = c.b - c.s;
+        ctx.font = `600 11px ${MONO}`; ctx.fillStyle = dl >= 0 ? BULL : BEAR_HI;
+        ctx.fillText(`Δ ${dl > 0 ? '+' : ''}${fmtQ(dl)}`, x0 + colW / 2, yOf(c.l) + rowPx / 2 + 12);
+        ctx.fillStyle = '#6b7684'; ctx.font = `10.5px ${MONO}`;
+        ctx.fillText(`V ${fmtQ(c.v)}`, x0 + colW / 2, yOf(c.l) + rowPx / 2 + 26);
+      }
+    }
+    ctx.textAlign = 'left';
+  }
+TypeScript  private renderSingleProfile(
+    bars: Bar[],
+    first: number,
+    last: number,
+    isDaily: boolean,
+    side: 'right' | 'left',
+    yOf: (p: number) => number,
+    row: number,
+    pxRow: number,
+    plotW: number,
+    mainH: number,
+    fmtP: (p: number) => string
+  ) {
+    const ctx = this.ctx, f = this.flow;
+
+    let f0 = first;
+    if (isDaily) {
+      const d0 = new Date(bars[last].t);
+      d0.setUTCHours(0, 0, 0, 0);
+      const dayStartMs = d0.getTime();
+      f0 = last;
+      while (f0 > 0 && bars[f0 - 1].t >= dayStartMs) f0--;
+    }
+    if (f0 > last) return;
+
+    const rawProf = new Map<number, { s: number; b: number; tot: number }>();
+    let totVol = 0, totBuy = 0, totSell = 0;
+    const addRaw = (k: number, s: number, b: number) => {
+      let r = rawProf.get(k);
+      if (!r) { r = { s: 0, b: 0, tot: 0 }; rawProf.set(k, r); }
+      r.s += s; r.b += b; r.tot += s + b;
+      totVol += s + b; totBuy += b; totSell += s;
+    };
+
+    for (let i = f0; i <= last; i++) {
+      const c = bars[i];
+      if (c.fp && c.fp.size > 0) {
+        for (const [k, [s, b]] of c.fp) addRaw(k, s, b);
+      } else {
+        const kLo = Math.round(c.l / row), kHi = Math.round(c.h / row);
+        const bLo = Math.round(Math.min(c.o, c.c) / row), bHi = Math.round(Math.max(c.o, c.c) / row);
+        let wSum = 0;
+        for (let k = kLo; k <= kHi; k++) wSum += (k >= bLo && k <= bHi) ? 2 : 1;
+        if (wSum > 0) {
+          const sUnit = c.s / wSum, bUnit = c.b / wSum;
+          for (let k = kLo; k <= kHi; k++) {
+            const w = (k >= bLo && k <= bHi) ? 2 : 1;
+            addRaw(k, sUnit * w, bUnit * w);
+          }
+        }
+      }
+    }
+    if (!rawProf.size || totVol <= 0) return;
+
+    const targetBinPx = 4.5;
+    const kGroup = Math.max(1, Math.round(targetBinPx / Math.max(0.001, pxRow)));
+    const binH = Math.max(2, Math.min(pxRow * kGroup - 0.8, 30));
+
+    const binnedProf = new Map<number, { s: number; b: number; tot: number; pv: number; price: number; maxK: number; maxKVol: number }>();
+    for (const [k, v] of rawProf) {
+      const binKey = Math.floor(k / kGroup) * kGroup;
+      let bin = binnedProf.get(binKey);
+      if (!bin) {
+        bin = { s: 0, b: 0, tot: 0, pv: 0, price: (binKey + (kGroup - 1) / 2) * row, maxK: k, maxKVol: v.tot };
+        binnedProf.set(binKey, bin);
+      }
+      bin.s += v.s; bin.b += v.b; bin.tot += v.tot;
+      bin.pv += (k * row) * v.tot;
+      if (v.tot > bin.maxKVol) { bin.maxKVol = v.tot; bin.maxK = k; }
+    }
+    for (const bin of binnedProf.values()) {
+      // Exact price of the dominant sub-row inside the bin so POC/VAH/VAL never drift from tick grid
+      bin.price = bin.maxK * row;
+    }
+
+    let maxBinVol = 0, pocKey = 0, maxDelta = 0, deltaPocKey = 0;
+    for (const [bk, bin] of binnedProf) {
+      if (bin.tot > maxBinVol) { maxBinVol = bin.tot; pocKey = bk; }
+      const d = Math.abs(bin.b - bin.s);
+      if (d > maxDelta) { maxDelta = d; deltaPocKey = bk; }
+    }
+    if (maxBinVol <= 0) return;
+
+    const binKeys = [...binnedProf.keys()].sort((a, b) => a - b);
+    const pocIdx = binKeys.indexOf(pocKey);
+    const vaPct = Math.max(0.5, Math.min(0.95, (f?.vpVaPct || 70) / 100));
+    const targetVa = totVol * vaPct;
+
+    const inVaSet = new Set<number>();
+    inVaSet.add(pocKey);
+    let curVaVol = binnedProf.get(pocKey)!.tot;
+    let up = pocIdx + 1, dn = pocIdx - 1;
+    while (curVaVol < targetVa && (up < binKeys.length || dn >= 0)) {
+      const upVol = up < binKeys.length ? binnedProf.get(binKeys[up])!.tot : -1;
+      const dnVol = dn >= 0 ? binnedProf.get(binKeys[dn])!.tot : -1;
+      if (upVol >= dnVol && up < binKeys.length) {
+        inVaSet.add(binKeys[up]);
+        curVaVol += upVol;
+        up++;
+      } else if (dn >= 0) {
+        inVaSet.add(binKeys[dn]);
+        curVaVol += dnVol;
+        dn--;
+      } else break;
+    }
+
+    const pocPrice = binnedProf.get(pocKey)!.price;
+    const deltaPocPrice = binnedProf.get(deltaPocKey)!.price;
+    const valPrice = binnedProf.get(binKeys[Math.max(0, dn + 1)])!.price;
+    const vahPrice = binnedProf.get(binKeys[Math.min(binKeys.length - 1, up - 1)])!.price;
+
+    const maxW = Math.min(plotW * 0.42, Math.max(130, plotW * ((f?.vpWidth || 22) / 100)));
+    const vpMode = f?.vpMode || 'split';
+    const isSplit = vpMode === 'split';
+
+    for (const [bk, bin] of binnedProf) {
+      const midPrice = (bk + (kGroup - 1) / 2) * row;
+      const yy = Math.round(yOf(midPrice));
+      if (yy < -20 || yy > mainH + 20) continue;
+      const yTop = Math.round(yy - binH / 2);
+      const inVa = inVaSet.has(bk);
+      const isPoc = (bk === pocKey);
+      const isHvn = bin.tot >= maxBinVol * 0.85;
+
+      if (vpMode === 'split' || vpMode === 'normal') {
+        const allocW = isSplit ? maxW * 0.65 : maxW;
+        const wNorm = Math.max(2, (bin.tot / maxBinVol) * allocW);
+        const buyRatio = bin.b / (bin.tot || 1);
+        const wBuy = wNorm * buyRatio;
+        const wSell = wNorm - wBuy;
+
+        let buyCol: string, sellCol: string;
+        if (isPoc) {
+          buyCol = 'rgba(230, 200, 74, 0.95)';
+          sellCol = 'rgba(215, 175, 45, 0.95)';
+        } else if (inVa) {
+          buyCol = 'rgba(46, 189, 133, 0.82)';
+          sellCol = 'rgba(168, 85, 247, 0.82)';
+        } else {
+          buyCol = 'rgba(46, 189, 133, 0.28)';
+          sellCol = 'rgba(168, 85, 247, 0.28)';
+        }
+
+        if (side === 'right') {
+          const barLeft = plotW - wNorm;
+          ctx.fillStyle = sellCol;
+          ctx.fillRect(barLeft, yTop, wSell, binH);
+          ctx.fillStyle = buyCol;
+          ctx.fillRect(barLeft + wSell, yTop, wBuy, binH);
+          if (isHvn && !isPoc) {
+            ctx.fillStyle = '#eb2f2f';
+            ctx.fillRect(barLeft - 3, yTop, 3, binH);
+          }
+        } else {
+          ctx.fillStyle = buyCol;
+          ctx.fillRect(0, yTop, wBuy, binH);
+          ctx.fillStyle = sellCol;
+          ctx.fillRect(wBuy, yTop, wSell, binH);
+          if (isHvn && !isPoc) {
+            ctx.fillStyle = '#eb2f2f';
+            ctx.fillRect(wNorm, yTop, 3, binH);
+          }
+        }
+      }
+
+      if (vpMode === 'split' || vpMode === 'delta') {
+        const allocW = isSplit ? maxW * 0.32 : maxW;
+        const delta = bin.b - bin.s;
+        const absDelta = Math.abs(delta);
+        const wDelta = Math.max(1, (absDelta / (maxDelta || 1)) * allocW);
+        const isPos = delta >= 0;
+
+        const dCol = isPos
+          ? (inVa ? 'rgba(34, 197, 139, 0.90)' : 'rgba(34, 197, 139, 0.35)')
+          : (inVa ? 'rgba(168, 85, 247, 0.90)' : 'rgba(168, 85, 247, 0.35)');
+
+        if (side === 'right') {
+          const deltaBase = plotW - maxW;
+          ctx.fillStyle = dCol;
+          ctx.fillRect(deltaBase, yTop, wDelta, binH);
+        } else {
+          const deltaBase = maxW;
+          ctx.fillStyle = dCol;
+          ctx.fillRect(deltaBase - wDelta, yTop, wDelta, binH);
+        }
+      }
+    }
+
+    ctx.strokeStyle = 'rgba(229, 207, 122, 0.40)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    let started = false;
+    for (const bk of binKeys) {
+      const bin = binnedProf.get(bk)!;
+      const midPrice = (bk + (kGroup - 1) / 2) * row;
+      const yy = Math.round(yOf(midPrice));
+      if (yy < 0 || yy > mainH) continue;
+      const allocW = isSplit ? maxW * 0.65 : maxW;
+      const wNorm = Math.max(2, (bin.tot / maxBinVol) * allocW);
+      const tipX = side === 'right' ? plotW - wNorm : wNorm;
+      if (!started) { ctx.moveTo(tipX, yy); started = true; }
+      else { ctx.lineTo(tipX, yy); }
+    }
+    if (started) ctx.stroke();
+
+    const yyPoc = Math.round(yOf(pocPrice));
+    if (yyPoc >= 0 && yyPoc <= mainH) {
+      ctx.strokeStyle = 'rgba(230, 200, 74, 0.45)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      ctx.moveTo(0, yyPoc);
+      ctx.lineTo(plotW, yyPoc);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      ctx.strokeStyle = '#e6c84a';
+      ctx.lineWidth = 1.6;
+      ctx.beginPath();
+      if (side === 'right') { ctx.moveTo(plotW - maxW, yyPoc); ctx.lineTo(plotW, yyPoc); }
+      else { ctx.moveTo(0, yyPoc); ctx.lineTo(maxW, yyPoc); }
+      ctx.stroke();
+      ctx.lineWidth = 1;
+    }
+
+    const yyVah = Math.round(yOf(vahPrice));
+    if (yyVah >= 0 && yyVah <= mainH) {
+      ctx.strokeStyle = 'rgba(56, 189, 248, 0.55)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 4]);
+      ctx.beginPath();
+      ctx.moveTo(side === 'right' ? plotW - maxW : 0, yyVah);
+      ctx.lineTo(side === 'right' ? plotW : maxW, yyVah);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    const yyVal = Math.round(yOf(valPrice));
+    if (yyVal >= 0 && yyVal <= mainH) {
+      ctx.strokeStyle = 'rgba(56, 189, 248, 0.55)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 4]);
+      ctx.beginPath();
+      ctx.moveTo(side === 'right' ? plotW - maxW : 0, yyVal);
+      ctx.lineTo(side === 'right' ? plotW : maxW, yyVal);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    const drawVpTag = (x: number, y: number, s: string, bgc: string, fg: string, align: 'left' | 'right') => {
+      if (!isFinite(y) || y < 0 || y > mainH) return;
+      ctx.font = `600 10px ${FONT}`;
+      const tw = ctx.measureText(s).width + 8;
+      const tagX = align === 'right' ? x - tw : x;
+      ctx.fillStyle = bgc;
+      ctx.fillRect(tagX, y - 7.5, tw, 15);
+      ctx.fillStyle = fg;
+      ctx.textBaseline = 'middle';
+      ctx.textAlign = 'left';
+      ctx.fillText(s, tagX + 4, y);
+    };
+
+    const prefix = isDaily ? 'D-' : '';
+    if (side === 'right') {
+      drawVpTag(plotW, yyPoc, `${prefix}POC ${fmtP(pocPrice)} (${fmtQ(binnedProf.get(pocKey)!.tot)})`, '#e6c84a', '#111315', 'right');
+      drawVpTag(plotW, yyVah, `${prefix}VAH ${fmtP(vahPrice)}`, '#0369a1', '#f0f9ff', 'right');
+      drawVpTag(plotW, yyVal, `${prefix}VAL ${fmtP(valPrice)}`, '#0369a1', '#f0f9ff', 'right');
+      if (isSplit && deltaPocPrice !== pocPrice) {
+        const yyDeltaPoc = Math.round(yOf(deltaPocPrice));
+        if (yyDeltaPoc >= 0 && yyDeltaPoc <= mainH) {
+          drawVpTag(plotW - maxW * 0.65, yyDeltaPoc, `ΔPOC ${fmtP(deltaPocPrice)}`, '#7c3aed', '#ffffff', 'right');
+        }
+      }
+    } else {
+      drawVpTag(0, yyPoc, `${prefix}POC ${fmtP(pocPrice)} (${fmtQ(binnedProf.get(pocKey)!.tot)})`, '#e6c84a', '#111315', 'left');
+      drawVpTag(0, yyVah, `${prefix}VAH ${fmtP(vahPrice)}`, '#0369a1', '#f0f9ff', 'left');
+      drawVpTag(0, yyVal, `${prefix}VAL ${fmtP(valPrice)}`, '#0369a1', '#f0f9ff', 'left');
+    }
+
+    const netDelta = totBuy - totSell;
+    const buyPct = Math.round((totBuy / (totVol || 1)) * 100);
+    const sellPct = 100 - buyPct;
+    const title = isDaily ? 'DAILY VP (UTC)' : 'VISIBLE VP';
+    const badgeText = `${title}  ·  Vol: ${fmtQ(totVol)}  ·  Buy: ${buyPct}%  ·  Sell: ${sellPct}%  ·  Δ: ${netDelta >= 0 ? '+' : ''}${fmtQ(netDelta)}`;
+
+    ctx.font = `600 10.5px ${FONT}`;
+    const bW = ctx.measureText(badgeText).width + 24;
+    const bX = side === 'right' ? plotW - bW - 8 : 8;
+    const bY = 8;
+
+    ctx.fillStyle = 'rgba(18, 20, 24, 0.88)';
+    if (typeof (ctx as any).roundRect === 'function') {
+      ctx.beginPath();
+      (ctx as any).roundRect(bX, bY, bW, 20, 4);
+      ctx.fill();
+    } else {
+      ctx.fillRect(bX, bY, bW, 20);
+    }
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.12)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    ctx.fillStyle = isDaily ? '#38bdf8' : '#2ebd85';
+    ctx.beginPath();
+    ctx.arc(bX + 10, bY + 10, 3, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = '#e2e8f0';
+    ctx.textBaseline = 'middle';
+    ctx.textAlign = 'left';
+    ctx.fillText(badgeText, bX + 18, bY + 10);
+  }
+TypeScript  private drawImbalanceZones(bars: Bar[], first: number, last: number, xOf: (i: number) => number, yOf: (p: number) => number, row: number, plotW: number, cw: number) {
+    const ctx = this.ctx, n = bars.length, ratio = this.flow.fpRatio || 3, minV = this.flow.fpMinVol || 0, zones: { i: number; lo: number; hi: number; side: 1 | -1 }[] = [];
+    for (let i = Math.max(0, first - 200); i <= last; i++) {
+      const c = bars[i]; if (c.fp.size < 4) continue;
+      const ks = [...c.fp.keys()].sort((a, b) => a - b);
+      let maxRowVol = 0;
+      for (const [, [s, b]] of c.fp) if (s + b > maxRowVol) maxRowVol = s + b;
+      const effMinV = minV > 0 ? minV : maxRowVol * 0.08;
+
+      let rb = 0, bS = 0, bE = 0, rs = 0, sS = 0, sE = 0;
+      for (let j = 1; j <= ks.length; j++) {
+        const cur = j < ks.length ? c.fp.get(ks[j])! : null, prev = c.fp.get(ks[j - 1])!;
+        const adj = !!cur && (ks[j] - ks[j - 1] <= 2);
+        if (adj && cur![1] >= prev[0] * ratio && cur![1] >= effMinV) {
+          if (!rb) bS = ks[j]; bE = ks[j]; rb++;
+        } else {
+          if (rb >= 3) zones.push({ i, lo: (bS - 0.5) * row, hi: (bE + 0.5) * row, side: 1 });
+          rb = 0;
+        }
+        if (adj && prev[0] >= cur![1] * ratio && prev[0] >= effMinV) {
+          if (!rs) sS = ks[j - 1]; sE = ks[j - 1]; rs++;
+        } else {
+          if (rs >= 3) zones.push({ i, lo: (sS - 0.5) * row, hi: (sE + 0.5) * row, side: -1 });
+          rs = 0;
+        }
+      }
+    }
+    for (const z of zones) {
+      let end = n;
+      for (let j = z.i + 1; j < n; j++) if (z.side > 0 ? bars[j].l < z.lo : bars[j].h > z.hi) { end = j; break; }
+      if (end < first) continue;
+      const x1 = xOf(z.i) - cw / 2, x2 = end >= n ? plotW : xOf(end), y1 = yOf(z.hi), y2 = yOf(z.lo), open = end >= n;
+      const col = z.side > 0 ? '0,229,255' : '255,61,245';
+      ctx.fillStyle = `rgba(${col},${open ? 0.16 : 0.07})`; ctx.fillRect(x1, y1, x2 - x1, y2 - y1);
+      ctx.fillStyle = `rgba(${col},${open ? 0.9 : 0.4})`; ctx.fillRect(x1, y1, 2, y2 - y1);
+      if (open) { ctx.strokeStyle = `rgba(${col},0.55)`; ctx.beginPath(); ctx.moveTo(x1, y1 + 0.5); ctx.lineTo(x2, y1 + 0.5); ctx.moveTo(x1, y2 - 0.5); ctx.lineTo(x2, y2 - 0.5); ctx.stroke(); }
+    }
+  }
+
+  private drawWalls(yOf: (p: number) => number, plotW: number, mainH: number, row: number, xLast: number) {
+    const ctx = this.ctx, md = this.md!, lv = new Map<number, [number, 1 | -1]>();
+    for (const [p, q] of md.book.b) { const k = Math.round(p / row); const e = lv.get(k) || [0, 1]; e[0] += q; lv.set(k, e); }
+    for (const [p, q] of md.book.a) { const k = Math.round(p / row); const e = lv.get(k) || [0, -1]; e[0] += q; e[1] = -1; lv.set(k, e); }
+    if (lv.size < 6) return;
+    const sizes = [...lv.values()].map(e => e[0]).sort((a, b) => a - b), med = sizes[sizes.length >> 1] || 1, mx = sizes[sizes.length - 1];
+    const mult = settings.get().wallMult || 3;
+    const pick = (side: 1 | -1) => [...lv.entries()].filter(([, e]) => e[1] === side && e[0] >= med * mult).sort((a, b) => b[1][0] - a[1][0]).slice(0, 3);
+    ctx.font = `600 10.5px ${MONO}`; ctx.textBaseline = 'middle';
+    for (const [k, [q, side]] of [...pick(1), ...pick(-1)]) {
+      const yy = yOf(k * row); if (yy < 4 || yy > mainH - 4) continue;
+      const col = side > 0 ? '34,197,139' : '164,124,242', w = 1 + 3 * (q / mx), x0 = Math.max(0, xLast + 6);
+      ctx.strokeStyle = `rgba(${col},0.18)`; ctx.lineWidth = 1; ctx.setLineDash([3, 5]); ctx.beginPath(); ctx.moveTo(0, yy); ctx.lineTo(x0, yy); ctx.stroke(); ctx.setLineDash([]);
+      ctx.strokeStyle = `rgba(${col},0.75)`; ctx.lineWidth = w; ctx.beginPath(); ctx.moveTo(x0, yy); ctx.lineTo(plotW, yy); ctx.stroke(); ctx.lineWidth = 1;
+      const s = `${side > 0 ? 'BID' : 'ASK'} ${fmtQ(q)}`, tw = ctx.measureText(s).width + 10;
+      ctx.fillStyle = side > 0 ? '#14684a' : '#4b2d86'; ctx.fillRect(plotW - tw - 4, yy - 8, tw, 16); ctx.fillStyle = '#fff'; ctx.textAlign = 'left'; ctx.fillText(s, plotW - tw + 1, yy);
+    }
+  }
+File 4: web/src/chart/drawings.ts (Fixed Range Volume Profile & Order-Flow Tools)Fixes:Exact Tick-Aligned Fixed Range Volume Profile (fixedvp): Replaces the floating-point numRows and 3-bin smoothVol distortion with exact row-aligned binning (V.row * kGroup), so POC, ΔPOC, VWAP, VAH, VAL, and Total Volume in fixedvp are 100% mathematically identical to the raw footprint and rangeStats().Exact VWAP in rangeStats(): Computes VWAP from footprint cells when available rather than candle (H+L+C)/3.TypeScript// Replace rangeStats() and the 'fixedvp' tool definition in web/src/chart/drawings.ts:
+
+function rangeStats(V: DView, t0: number, t1: number, plo = -Infinity, phi = Infinity): RS | null {
+  const bars = V.bars; if (!bars.length) return null;
+  if (t0 > t1) [t0, t1] = [t1, t0];
+  const i0 = Math.max(0, barIndexFrom(bars, t0)), i1 = Math.min(bars.length - 1, barIndexAt(bars, t1));
+  if (i1 < i0) return null;
+  const band = isFinite(plo) || isFinite(phi), prof = new Map<number, number>(), cvd: number[] = [];
+  let vol = 0, buy = 0, sell = 0, hi = -Infinity, lo = Infinity, pv = 0, bigB = 0, bigS = 0, bigBq = 0, bigSq = 0, cum = 0;
+  for (let i = i0; i <= i1; i++) {
+    const b = bars[i]; hi = Math.max(hi, b.h); lo = Math.min(lo, b.l);
+    let bb = 0, ss = 0;
+    if (b.fp.size) {
+      for (const [k, [s, q]] of b.fp) {
+        const p = k * V.row;
+        if (p < plo || p > phi) continue;
+        bb += q; ss += s;
+        pv += p * (q + s);
+        prof.set(k, (prof.get(k) || 0) + q + s);
+      }
+    } else if (!band || (b.h >= plo && b.l <= phi)) {
+      const share = band ? Math.max(0, Math.min(b.h, phi) - Math.max(b.l, plo)) / ((b.h - b.l) || 1) : 1;
+      bb = b.b * share; ss = b.s * share;
+      const tp = (b.h + b.l + b.c) / 3;
+      pv += tp * (bb + ss);
+      const k = Math.round(tp / V.row);
+      prof.set(k, (prof.get(k) || 0) + bb + ss);
+    }
+    buy += bb; sell += ss; vol += bb + ss; cum += bb - ss; cvd.push(cum);
+    for (const t of b.big) { if (t[1] < plo || t[1] > phi) continue; if (t[3] > 0) { bigB++; bigBq += t[2]; } else { bigS++; bigSq += t[2]; } }
+  }
+  let poc: number | null = null, mx = 0; for (const [k, v] of prof) if (v > mx) { mx = v; poc = k * V.row; }
+  const j0 = Math.max(0, i0 - 50), j1 = i0 > 10 ? i0 - 1 : i1; let sv = 0, sr = 0, m = 0;
+  for (let j = j0; j <= j1; j++) { sv += bars[j].v; sr += bars[j].h - bars[j].l; m++; }
+  return { n: i1 - i0 + 1, i0, i1, o: bars[i0].o, c: bars[i1].c, hi, lo, vol, buy, sell, delta: buy - sell, cvd, poc, vwap: vol ? pv / vol : NaN, bigB, bigS, bigBq, bigSq, avgVol: m ? sv / m : 0, avgRng: m ? sr / m : 0, ms: bars[i1].t - bars[i0].t };
+}
+TypeScript  { id: 'fixedvp', label: 'Fixed range volume profile', group: 'Volume Profile', icon: 'fixedvp', n: 2, color: '#7d7432', key: 'Alt+P',
+    init(d, V) {
+      if (d.pts.length < 2) return;
+      const ta = Math.min(d.pts[0].t, d.pts[1].t), tb = Math.max(d.pts[0].t, d.pts[1].t);
+      const i0 = Math.max(0, barIndexFrom(V.bars, ta)), i1 = barIndexAt(V.bars, tb);
+      let hi = -Infinity, lo = Infinity;
+      for (let i = i0; i <= i1; i++) { hi = Math.max(hi, V.bars[i].h); lo = Math.min(lo, V.bars[i].l); }
+      if (isFinite(hi) && isFinite(lo)) {
+        d.pts[0] = { t: ta, p: hi };
+        d.pts[1] = { t: tb, p: lo };
+      }
+    },
+    moveHandle(d, hi, pt) {
+      if (d.pts.length < 2) return;
+      let t1 = Math.min(d.pts[0].t, d.pts[1].t), t2 = Math.max(d.pts[0].t, d.pts[1].t);
+      let p1 = Math.max(d.pts[0].p, d.pts[1].p), p2 = Math.min(d.pts[0].p, d.pts[1].p);
+      if (hi === 0) { t1 = pt.t; p1 = pt.p; }
+      else if (hi === 1) { t2 = pt.t; p1 = pt.p; }
+      else if (hi === 2) { t1 = pt.t; p2 = pt.p; }
+      else if (hi === 3) { t2 = pt.t; p2 = pt.p; }
+      else if (hi === 4 || hi === 5) { p1 = pt.p; }
+      else if (hi === 6 || hi === 7) { p2 = pt.p; }
+      else if (hi === 8 || hi === 9) { t2 = pt.t; }
+      d.pts[0] = { t: Math.min(t1, t2), p: Math.max(p1, p2) };
+      d.pts[1] = { t: Math.max(t1, t2), p: Math.min(p1, p2) };
+    },
+    render(g, d, V, s) {
+      if (d.pts.length < 2) return;
+      const ta = Math.min(d.pts[0].t, d.pts[1].t), tb = Math.max(d.pts[0].t, d.pts[1].t);
+      const x1 = Math.min(V.x(d.pts[0].t), V.x(d.pts[1].t)), x2 = Math.max(V.x(d.pts[0].t), V.x(d.pts[1].t));
+      const i0 = Math.max(0, barIndexFrom(V.bars, ta)), i1 = barIndexAt(V.bars, tb);
+
+      let barHi = -Infinity, barLo = Infinity;
+      for (let i = i0; i <= i1; i++) { barHi = Math.max(barHi, V.bars[i].h); barLo = Math.min(barLo, V.bars[i].l); }
+      if (!isFinite(barHi)) return;
+
+      const pHi = Math.max(d.pts[0].p, d.pts[1].p), pLo = Math.min(d.pts[0].p, d.pts[1].p);
+      const hi = Math.abs(pHi - pLo) < V.tick ? barHi : pHi;
+      const lo = Math.abs(pHi - pLo) < V.tick ? barLo : pLo;
+      const yTop = Math.min(V.y(hi), V.y(lo)), yBot = Math.max(V.y(hi), V.y(lo));
+
+      // Align bins strictly to instrument row multiples (V.row)
+      const kMin = Math.floor(lo / V.row), kMax = Math.ceil(hi / V.row);
+      const totalRawRows = Math.max(1, kMax - kMin + 1);
+      const pxPerRow = Math.abs(yBot - yTop) / totalRawRows;
+      const kGroup = Math.max(1, Math.round(3.5 / Math.max(0.01, pxPerRow)));
+      const binStepPrice = kGroup * V.row;
+
+      const rawProf = new Map<number, { s: number; b: number; tot: number }>();
+      let totalProfileVol = 0, sumPriceVol = 0, totalBuyVol = 0, totalSellVol = 0;
+
+      const addRaw = (k: number, ss: number, bb: number) => {
+        const p = k * V.row;
+        if (p < lo - 1e-9 || p > hi + 1e-9) return;
+        let r = rawProf.get(k);
+        if (!r) { r = { s: 0, b: 0, tot: 0 }; rawProf.set(k, r); }
+        r.s += ss; r.b += bb; r.tot += ss + bb;
+        totalProfileVol += ss + bb;
+        totalBuyVol += bb;
+        totalSellVol += ss;
+        sumPriceVol += p * (ss + bb);
+      };
+
+      for (let i = i0; i <= i1; i++) {
+        const b = V.bars[i];
+        if (b.fp && b.fp.size) {
+          for (const [k, [ss, bb]] of b.fp) addRaw(k, ss, bb);
+        } else {
+          const bLo = Math.max(lo, b.l), bHi = Math.min(hi, b.h);
+          if (bHi < bLo) continue;
+          const k0 = Math.round(bLo / V.row), k1 = Math.round(bHi / V.row);
+          const body0 = Math.round(Math.min(b.o, b.c) / V.row), body1 = Math.round(Math.max(b.o, b.c) / V.row);
+          let wSum = 0;
+          for (let k = k0; k <= k1; k++) wSum += (k >= body0 && k <= body1) ? 2 : 1;
+          if (wSum > 0) {
+            const share = (bHi - bLo) / ((b.h - b.l) || 1);
+            const sUnit = (b.s * share) / wSum, bUnit = (b.b * share) / wSum;
+            for (let k = k0; k <= k1; k++) {
+              const w = (k >= body0 && k <= body1) ? 2 : 1;
+              addRaw(k, sUnit * w, bUnit * w);
+            }
+          }
+        }
+      }
+
+      if (!rawProf.size || totalProfileVol <= 0) return;
+
+      interface RowBin {
+        bk: number; pLow: number; pHigh: number; pMid: number; exactPrice: number;
+        totalVol: number; buyVol: number; sellVol: number;
+        maxSubK: number; maxSubVol: number;
+        inValueArea: boolean; isHVN: boolean;
+      }
+
+      const binMap = new Map<number, RowBin>();
+      for (const [k, v] of rawProf) {
+        const bk = Math.floor((k - kMin) / kGroup) * kGroup + kMin;
+        let bin = binMap.get(bk);
+        if (!bin) {
+          const pCenter = (bk + (kGroup - 1) * 0.5) * V.row;
+          bin = {
+            bk,
+            pLow: pCenter - binStepPrice * 0.5,
+            pHigh: pCenter + binStepPrice * 0.5,
+            pMid: pCenter,
+            exactPrice: k * V.row,
+            totalVol: 0, buyVol: 0, sellVol: 0,
+            maxSubK: k, maxSubVol: v.tot,
+            inValueArea: false, isHVN: false,
+          };
+          binMap.set(bk, bin);
+        }
+        bin.totalVol += v.tot;
+        bin.buyVol += v.b;
+        bin.sellVol += v.s;
+        if (v.tot > bin.maxSubVol) {
+          bin.maxSubVol = v.tot;
+          bin.maxSubK = k;
+          bin.exactPrice = k * V.row;
+        }
+      }
+
+      const rows = [...binMap.values()].sort((a, b) => a.bk - b.bk);
+      const numRows = rows.length;
+
+      let maxRowVol = 0, maxDelta = 0, pocRowIdx = 0, deltaPocRowIdx = 0;
+      for (let r = 0; r < numRows; r++) {
+        if (rows[r].totalVol > maxRowVol) {
+          maxRowVol = rows[r].totalVol;
+          pocRowIdx = r;
+        }
+        const dlt = Math.abs(rows[r].buyVol - rows[r].sellVol);
+        if (dlt > maxDelta) {
+          maxDelta = dlt;
+          deltaPocRowIdx = r;
+        }
+      }
+      if (maxRowVol <= 0) return;
+
+      const pocPrice = rows[pocRowIdx].exactPrice;
+      const deltaPocPrice = rows[deltaPocRowIdx].exactPrice;
+      const vwapPrice = sumPriceVol / totalProfileVol;
+
+      // Standard 70% Contiguous Value Area Expansion on true volume
+      const targetVA = totalProfileVol * 0.70;
+      let accumVA = rows[pocRowIdx].totalVol;
+      rows[pocRowIdx].inValueArea = true;
+      let upIdx = pocRowIdx + 1, downIdx = pocRowIdx - 1;
+      while (accumVA < targetVA && (upIdx < numRows || downIdx >= 0)) {
+        const upVol = upIdx < numRows ? rows[upIdx].totalVol : -1;
+        const downVol = downIdx >= 0 ? rows[downIdx].totalVol : -1;
+        if (upVol >= downVol && upIdx < numRows) {
+          rows[upIdx].inValueArea = true;
+          accumVA += upVol;
+          upIdx++;
+        } else if (downIdx >= 0) {
+          rows[downIdx].inValueArea = true;
+          accumVA += downVol;
+          downIdx--;
+        } else break;
+      }
+      const vahPrice = rows[Math.min(numRows - 1, upIdx - 1)].exactPrice;
+      const valPrice = rows[Math.max(0, downIdx + 1)].exactPrice;
+
+      // Identify High-Volume Node (HVN) spikes
+      for (let r = 2; r < numRows - 2; r++) {
+        const cur = rows[r].totalVol;
+        if (
+          cur > maxRowVol * 0.25 &&
+          cur >= rows[r - 1].totalVol &&
+          cur >= rows[r + 1].totalVol &&
+          cur > rows[r - 2].totalVol * 1.05 &&
+          cur > rows[r + 2].totalVol * 1.05
+        ) {
+          rows[r].isHVN = true;
+        }
+      }
+
+      const boxWidth = Math.max(20, x2 - x1);
+      const maxProfileWidth = boxWidth * 0.28;
+      const maxLeftDeltaWidth = Math.min(100, Math.max(45, boxWidth * 0.24));
+
+      // 1. Left-Side Pure Net Delta Profile
+      const deltaContour: [number, number][] = [];
+      rows.forEach(row => {
+        const yTopRow = V.y(row.pHigh);
+        const yBotRow = V.y(row.pLow);
+        const h = Math.max(1.2, Math.abs(yBotRow - yTopRow) - 0.4);
+        const yy = Math.min(yTopRow, yBotRow);
+        const yMid = (yTopRow + yBotRow) / 2;
+
+        const delta = row.buyVol - row.sellVol;
+        const absDelta = Math.abs(delta);
+        if (absDelta <= 0.0001 || maxDelta <= 0) return;
+
+        const w = Math.max(1.5, (absDelta / maxDelta) * maxLeftDeltaWidth);
+        const isBuyer = delta >= 0;
+        const fill = row.inValueArea
+          ? (isBuyer ? 'rgba(34, 197, 139, 0.90)' : 'rgba(168, 85, 247, 0.90)')
+          : (isBuyer ? 'rgba(34, 197, 139, 0.35)' : 'rgba(168, 85, 247, 0.35)');
+
+        g.rect(x1 - w, yy, w, h, { fill, stroke: false });
+        deltaContour.push([x1 - w, yMid]);
+      });
+
+      if (deltaContour.length > 1) {
+        g.poly(deltaContour, { color: 'rgba(255, 255, 255, 0.16)', width: 1 });
+      }
+
+      // 2. Right-Side Volume Profile Histogram
+      const contourPts: [number, number][] = [];
+      rows.forEach(row => {
+        const yTopRow = V.y(row.pHigh);
+        const yBotRow = V.y(row.pLow);
+        const h = Math.max(1.5, Math.abs(yBotRow - yTopRow) + 0.2);
+        const yy = Math.min(yTopRow, yBotRow);
+        const yMid = (yTopRow + yBotRow) / 2;
+        const w = (row.totalVol / maxRowVol) * maxProfileWidth;
+
+        const fill = row.inValueArea ? 'rgba(202, 96, 44, 0.82)' : 'rgba(194, 174, 82, 0.75)';
+        if (w > 0.5) g.rect(x1, yy, w, h, { fill, stroke: false });
+        contourPts.push([x1 + w, yMid]);
+      });
+
+      if (contourPts.length > 1) {
+        g.poly(contourPts, { color: '#e5cf7a', width: 1.1 });
+      }
+
+      // 3. Red Horizontal HVN Spikes
+      rows.forEach(row => {
+        if (row.isHVN) {
+          const yMid = V.y(row.pMid);
+          const w = (row.totalVol / maxRowVol) * maxProfileWidth;
+          g.rect(x1, yMid - 1.1, w + 4, 2.2, { fill: '#e63329', stroke: false });
+        }
+      });
+
+      // 4. Horizontal Reference Lines inside the Box (VAH, VAL, POC, VWAP)
+      const vahY = V.y(vahPrice);
+      g.line(x1, vahY, x2, vahY, { color: 'rgba(82, 168, 196, 0.75)', width: 1, dash: [2, 2] });
+
+      const valY = V.y(valPrice);
+      g.line(x1, valY, x2, valY, { color: 'rgba(82, 168, 196, 0.75)', width: 1, dash: [2, 2] });
+
+      const pocY = V.y(pocPrice);
+      g.line(x1, pocY, x2, pocY, { color: '#d938ca', width: 1.4, dash: [3, 2] });
+
+      const vwapY = V.y(vwapPrice);
+      g.line(x1, vwapY, x2, vwapY, { color: '#e6c619', width: 1.2, dash: [3, 2] });
+
+      if (deltaPocRowIdx !== pocRowIdx) {
+        const deltaPocY = V.y(deltaPocPrice);
+        g.line(x1 - maxLeftDeltaWidth, deltaPocY, x1, deltaPocY, { color: 'rgba(168, 85, 247, 0.75)', width: 1.2, dash: [2, 2] });
+      }
+
+      // 5. Selection Box
+      g.rect(x1, yTop, x2 - x1, yBot - yTop, { stroke: '#7d7432', hitFill: true });
+
+      // 6. Detail Card on Select
+      if (s.sel) {
+        const st = rangeStats(V, ta, tb, lo, hi);
+        g.card(x2, yTop, 'Fixed Volume Profile', [
+          { k: 'POC', v: V.fmt(pocPrice), c: '#d938ca' },
+          { k: 'ΔPOC', v: V.fmt(deltaPocPrice), c: '#a855f7' },
+          { k: 'VWAP', v: V.fmt(vwapPrice), c: '#e6c619' },
+          { k: 'Value Area (70%)', v: V.fmt(valPrice) + ' – ' + V.fmt(vahPrice), c: '#52a8c4' },
+          { k: 'High · low', v: V.fmt(hi) + ' · ' + V.fmt(lo) },
+          { sep: true },
+          { k: 'Total Volume', v: fmtQ(totalProfileVol) },
+          { k: 'Net Delta', v: fq(totalBuyVol - totalSellVol), c: colOf(totalBuyVol - totalSellVol) },
+          { split: [totalBuyVol, totalSellVol] },
+          ...(st && st.cvd.length > 2 ? [{ spark: st.cvd }] : []),
+        ], { accent: '#ca602c' });
+      }
+    } },
+File 5: web/src/data/bookwatch.ts & web/src/components/Docks.tsxFixes:Replaces Math.floor(p / row) with Math.round(p / row) and p = k * row in BookWatcher (bookwatch.ts) and DomDock (Docks.tsx) so Iceberg, Pulled Liquidity, Filled Liquidity markers, and DOM ladder rows match the exact footprint and candle price levels.TypeScript// In web/src/data/bookwatch.ts, replace onTicks and onBook with:
+  private onTicks(ts: [number, number, number, Side, number?][]) {
+    for (const [, p, q, s] of ts) {
+      this.last = p;
+      const L = this.lv.get(this.key(s > 0 ? -1 : 1, Math.round(p / this.row)));
+      if (L) L.traded += q;
+    }
+  }
+
+  private onBook() {
+    const now = Date.now(), row = this.row, bins = new Map<string, { side: Side; k: number; q: number }>();
+    const add = (arr: [number, number][], side: Side) => {
+      for (const [p, q] of arr) {
+        const k = Math.round(p / row), key = this.key(side, k);
+        const e = bins.get(key);
+        if (e) e.q += q; else bins.set(key, { side, k, q });
+      }
+    };
+    add(this.md.book.b, 1); add(this.md.book.a, -1);
+    if (bins.size < 6) return;
+    const sizes = [...bins.values()].map(x => x.q).sort((a, b) => a - b), thr = (sizes[sizes.length >> 1] || 0) * this.mult;
+    const px = this.last || this.md.lastPrice, near = Math.max(row * 8, px * 0.002);
+
+    for (const [key, b] of bins) {
+      const L = this.lv.get(key);
+      if (L) {
+        if (b.q > L.size * 1.15 && L.traded > L.tradedAtLast) L.refills++;
+        L.tradedAtLast = L.traded; L.size = b.q; L.max = Math.max(L.max, b.q);
+        if (L.traded >= L.max * 1.5 && L.refills >= 1 && now - L.iceAt > 60_000) {
+          L.iceAt = now;
+          this.emit({ t: now, p: b.k * row, kind: 'ice', side: b.side, q: L.traded, refills: L.refills });
+        }
+      } else if (b.q >= thr && thr > 0) {
+        this.lv.set(key, { side: b.side, first: now, max: b.q, size: b.q, traded: 0, tradedAtLast: 0, refills: 0, iceAt: 0 });
+      }
+    }
+    for (const [key, L] of this.lv) {
+      const b = bins.get(key), k = +key.slice(1), p = k * row;
+      if (b && b.q >= L.max * 0.2) continue;
+      if (Math.abs(p - px) <= near && now - L.first > 1500) {
+        if (L.traded >= L.max * 0.6) this.emit({ t: now, p, kind: 'fill', side: L.side, q: L.max });
+        else if (L.traded < L.max * 0.25) this.emit({ t: now, p, kind: 'pull', side: L.side, q: L.max });
+      }
+      this.lv.delete(key);
+    }
+  }
+TypeScript// In web/src/components/Docks.tsx, replace the binning in DomDock (lines 22-35) with:
+  const bk = new Map<number, [number, number]>(); let mx = 1;
+  for (const [p, q] of bids) { const k = Math.round(p / row); const e = bk.get(k) || [0, 0]; e[0] += q; bk.set(k, e); }
+  for (const [p, q] of asks) { const k = Math.round(p / row); const e = bk.get(k) || [0, 0]; e[1] += q; bk.set(k, e); }
+  for (const e of bk.values()) mx = Math.max(mx, e[0], e[1]);
+  const lb = lastBar(), base = Math.round(px / row), vol = new Map<number, number>();
+  if (lb) for (const [k, [s, b]] of lb.fp) { const kk = Math.round((k * lb.fp ? k * row : 0) / row); vol.set(kk, (vol.get(kk) || 0) + s + b); }
+File 6: web/src/pages/ChartPage.tsx & web/src/pages/useSeries.tsFixes:In useSeries.ts: passes estSplit (!/binance/i.test(sym.venues) && /hyperliquid|bybit|coinbase|gate/i.test(sym.venues)) into B.seedKlines(k, estSplit) and B.addAll(d) on live tick batches so the Indicators preview and Backtest engine have the exact same Delta/CVD/VWAP series as the main trading chart.In ChartPage.tsx: wires soundFX.playBigTrade(), soundFX.playLiquidation(), and soundFX.playExecution() to live market events so the Audio FX synthesizer works automatically during live trading.TypeScript// In web/src/pages/useSeries.ts:
+export function useSeries(symId: string, specKey: string, live = true) {
+  const [state, setState] = useState<{ bars: Bar[]; series: Series | null; loading: boolean }>({ bars: [], series: null, loading: true });
+  const tick = useRef(0);
+  useEffect(() => {
+    const sym = net.get().symbols.find(s => s.id === symId); if (!sym) return;
+    const spec = parseSpec(specKey), m = data.get(symId);
+    const est = /hyperliquid|bybit|coinbase|gate/i.test(sym.venues) && !/binance/i.test(sym.venues);
+    let B = new BarBuilder(spec, sym.row, bigFor(sym.id, sym.bigUsd));
+    let k: Awaited<ReturnType<typeof data.klines>> = [], alive = true;
+    const rebuild = () => {
+      B = new BarBuilder(spec, sym.row, bigFor(sym.id, sym.bigUsd));
+      B.addAll(m.ticks);
+      if (spec.kind === 'time') B.seedKlines(k, est);
+      publish();
+    };
+    const publish = () => { if (alive) setState({ bars: B.bars, series: buildSeries(B.bars, sym.row), loading: false }); };
+    setState(s => ({ ...s, loading: true }));
+    if (spec.kind === 'time' && spec.sec >= 60) data.klines(symId, spec.sec, 1000).then(r => { k = r; rebuild(); }); else rebuild();
+    const off = m.on((e, d) => {
+      if (e === 'snap') rebuild();
+      else if (e === 'tk' && live) { B.addAll(d); if (++tick.current % 10 === 0) publish(); }
+    });
+    return () => { alive = false; off(); data.release(symId); };
+  }, [symId, specKey, live]);
+  return state;
+}
+3. How to Apply & RebuildReplace the code blocks above in their respective files (server/src/market.ts, web/src/data/bars.ts, web/src/chart/engine.ts, web/src/chart/drawings.ts, web/src/data/bookwatch.ts, web/src/components/Docks.tsx, web/src/pages/useSeries.ts).Run the TypeScript check and build the production bundle:Bashnpm run typecheck
+npm run build
+npm start
+</USER_REQUEST>
+<ADDITIONAL_METADATA>
+The current local time is: 2026-10-26T00:58:05+05:30.
+</ADDITIONAL_METADATA>
